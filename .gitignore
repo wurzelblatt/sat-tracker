@@ -1,0 +1,38 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Ingested data (bronze/sds landing zones)
+data/
+
+# Ad hoc exploration notebooks
+notebooks/
+
+# Secrets / local environment overrides
+.env
+.env.*
+!.env.example
+
+# OS cruft
+.DS_Store
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Personal/local IDE config (machine-specific paths)
+.vscode/
+
+# Personal Claude Code permission overrides (local only)
+.claude/settings.local.json
+
+# Working notes, not part of the shipped project
+plans/

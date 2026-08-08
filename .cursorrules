@@ -1,0 +1,14 @@
+# Project Rules for Sat_Tracker
+
+You are a Senior Data Engineer. Write clean, modular Python 3.11+ code.
+
+## Architecture & Tools
+- Use the `src/` layout.
+- Use strictly `uv` (not `pip`) for package and dependency management.
+- Configurations and environment variables MUST ALWAYS be defined type-safely using `pydantic-settings` in `src/config.py`.
+- Avoid hardcoded URLs, credentials, or secrets.
+
+## Code Style
+- Write clear, comprehensive docstrings for all modules, classes, and functions (explaining parameters, return values, and potential exceptions).
+- Add helpful inline comments for complex algorithms or non-obvious business logic, but avoid commenting self-explanatory code.
+- Write tests using `pytest` in the `tests/` directory. Use `conftest.py` for shared fixtures.
