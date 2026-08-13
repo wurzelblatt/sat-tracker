@@ -8,15 +8,18 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
-from OMM.OMM import OMM as OMMReader
 
+from sat_tracker.config import Settings
 from sat_tracker.ingest.celestrak_client import (
     CelesTrakFatalError,
+    CelesTrakVolumeBudgetExceeded,
+    _is_cache_fresh,
     fetch_omm_csv,
     fetch_omm_csv_group,
     fetch_omm_sds,
     fetch_omm_sds_group,
     ingest,
+    read_omm_sds,
 )
 
 ISS_CSV_RESPONSE = (
@@ -58,6 +61,12 @@ def _assert_landing_filename(path: Path, directory: Path, stem: str, suffix: str
     assert path.name.endswith(suffix)
 
 
+def _make_stale(path: Path, *, hours: int = 3) -> None:
+    """Backdate `path`'s mtime so the cache-freshness check treats it as expired."""
+    stale_timestamp = (datetime.now(UTC) - timedelta(hours=hours)).timestamp()
+    os.utime(path, (stale_timestamp, stale_timestamp))
+
+
 def test_fetch_omm_csv_writes_bronze_file(isolated_settings, mock_celestrak_response) -> None:
     """`fetch_omm_csv` should land the raw OMM-CSV response in the bronze zone."""
     mock_get = mock_celestrak_response(text=ISS_CSV_RESPONSE)
@@ -89,7 +98,9 @@ def test_fetch_omm_sds_writes_flatbuffer_file(isolated_settings, mock_celestrak_
     assert mock_get.call_args.kwargs["params"] == {"CATNR": 25544, "FORMAT": "json"}
     _assert_landing_filename(path, isolated_settings.sds_dir, "25544", ".sds")
 
-    omm = OMMReader.GetRootAs(path.read_bytes())
+    records = read_omm_sds(path)
+    assert len(records) == 1
+    omm = records[0]
     assert omm.NORAD_CAT_ID() == 25544
     assert omm.OBJECT_NAME() == b"ISS (ZARYA)"
     assert omm.OBJECT_ID() == b"1998-067A"
@@ -116,8 +127,30 @@ def test_fetch_omm_sds_group_writes_flatbuffer_file(isolated_settings, mock_cele
     assert mock_get.call_args.kwargs["params"] == {"GROUP": "starlink", "FORMAT": "json"}
     _assert_landing_filename(path, isolated_settings.sds_dir, "starlink", ".sds")
 
-    omm = OMMReader.GetRootAs(path.read_bytes())
-    assert omm.NORAD_CAT_ID() == 25544
+    records = read_omm_sds(path)
+    assert len(records) == 1
+    assert records[0].NORAD_CAT_ID() == 25544
+
+
+@pytest.mark.usefixtures("isolated_settings")
+def test_fetch_omm_sds_group_encodes_every_record(mock_celestrak_response) -> None:
+    """Every satellite in a group must be encoded, not just the first.
+
+    Regression test: the group flow previously wrote only `records[0]`,
+    silently discarding the rest of the constellation.
+    """
+    group_response = [
+        {**ISS_JSON_RESPONSE[0], "NORAD_CAT_ID": 40000 + index, "OBJECT_NAME": f"STARLINK-{index}"}
+        for index in range(5)
+    ]
+    mock_celestrak_response(json_body=group_response)
+
+    path = fetch_omm_sds_group("starlink")
+
+    records = read_omm_sds(path)
+    assert len(records) == 5
+    assert [record.NORAD_CAT_ID() for record in records] == [40000 + i for i in range(5)]
+    assert records[4].OBJECT_NAME() == b"STARLINK-4"
 
 
 def test_ingest_dispatches_to_csv_by_default(isolated_settings, mock_celestrak_response) -> None:
@@ -176,8 +209,7 @@ def test_fetch_omm_csv_refetches_stale_cache(isolated_settings, mock_celestrak_r
     cached_path = isolated_settings.bronze_dir / "25544_20260101T000000000000Z_stale-test.csv"
     cached_path.parent.mkdir(parents=True)
     cached_path.write_text("stale content")
-    stale_timestamp = (datetime.now(UTC) - timedelta(hours=3)).timestamp()
-    os.utime(cached_path, (stale_timestamp, stale_timestamp))
+    _make_stale(cached_path)
     mock_get = mock_celestrak_response(text=ISS_CSV_RESPONSE)
 
     path = fetch_omm_csv(norad_id=25544)
@@ -225,3 +257,145 @@ def test_fetch_omm_csv_writes_auditable_metadata_sidecar(mock_celestrak_response
 
     assert UUID(metadata["ingestion_id"])
     assert datetime.fromisoformat(metadata["ingested_at"]).tzinfo is not None
+    assert metadata["source"] == "celestrak"
+    assert metadata["source_file"] == path.name
+    assert metadata["target"] == "25544"
+    assert metadata["bytes"] == len(ISS_CSV_RESPONSE.encode("utf-8"))
+
+
+# --- Compliance shield: User-Agent, conditional requests, volume budget ---
+
+
+@pytest.mark.usefixtures("isolated_settings")
+def test_request_sends_identifying_user_agent(
+    settings: Settings, mock_celestrak_response
+) -> None:
+    """Every request must identify the client, per CelesTrak's usage policy."""
+    mock_get = mock_celestrak_response(text=ISS_CSV_RESPONSE)
+
+    fetch_omm_csv(norad_id=25544)
+
+    user_agent = mock_get.call_args.kwargs["headers"]["User-Agent"]
+    assert user_agent == settings.user_agent
+    assert "python-requests" not in user_agent
+
+
+@pytest.mark.usefixtures("isolated_settings")
+def test_etag_is_recorded_in_sidecar(mock_celestrak_response) -> None:
+    """A returned `ETag` should be persisted so the next fetch can be conditional."""
+    mock_celestrak_response(text=ISS_CSV_RESPONSE, etag='W/"abc123"')
+
+    path = fetch_omm_csv(norad_id=25544)
+    metadata = json.loads(path.with_name(path.name + ".meta.json").read_text())
+
+    assert metadata["etag"] == 'W/"abc123"'
+
+
+def test_stale_cache_replays_etag_as_conditional_request(
+    isolated_settings, mock_celestrak_response
+) -> None:
+    """A stale cached file with an `ETag` must trigger an `If-None-Match` request."""
+    cached_path = isolated_settings.bronze_dir / "25544_20260101T000000000000Z_etag-test.csv"
+    cached_path.parent.mkdir(parents=True)
+    cached_path.write_text("cached content")
+    cached_path.with_name(cached_path.name + ".meta.json").write_text(
+        json.dumps({"etag": 'W/"cached-etag"'})
+    )
+    _make_stale(cached_path)
+    mock_get = mock_celestrak_response(text=ISS_CSV_RESPONSE)
+
+    fetch_omm_csv(norad_id=25544)
+
+    assert mock_get.call_args.kwargs["headers"]["If-None-Match"] == 'W/"cached-etag"'
+
+
+def test_not_modified_response_reuses_cache_without_rewriting(
+    isolated_settings, mock_celestrak_response, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A `304 Not Modified` must reuse the cached bytes and refresh its TTL window."""
+    cached_path = isolated_settings.bronze_dir / "25544_20260101T000000000000Z_304-test.csv"
+    cached_path.parent.mkdir(parents=True)
+    cached_path.write_text("cached content")
+    _make_stale(cached_path)
+
+    mock_celestrak_response(status_code=304)
+
+    with caplog.at_level(logging.INFO):
+        path = fetch_omm_csv(norad_id=25544)
+
+    assert path == cached_path
+    assert path.read_text() == "cached content"
+    assert "HTTP 304" in caplog.text
+    # The TTL window is reset, so an immediate re-fetch is served from cache.
+    assert _is_cache_fresh(cached_path)
+
+
+@pytest.mark.usefixtures("isolated_settings")
+def test_download_volume_is_tallied_against_daily_budget(
+    isolated_settings, mock_celestrak_response
+) -> None:
+    """Downloaded bytes should accumulate in the on-disk volume ledger."""
+    mock_celestrak_response(text=ISS_CSV_RESPONSE)
+
+    fetch_omm_csv(norad_id=25544)
+    ledger = json.loads((isolated_settings.state_dir / "download_volume.json").read_text())
+
+    assert ledger["bytes"] == len(ISS_CSV_RESPONSE.encode("utf-8"))
+    assert ledger["date"] == datetime.now(UTC).date().isoformat()
+
+
+def test_fetch_halts_when_daily_budget_is_exhausted(
+    isolated_settings, mock_celestrak_response, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exceeding the daily byte budget must halt before any HTTP request is made."""
+    monkeypatch.setattr(isolated_settings, "daily_volume_budget_bytes", 100)
+    isolated_settings.state_dir.mkdir(parents=True)
+    (isolated_settings.state_dir / "download_volume.json").write_text(
+        json.dumps({"date": datetime.now(UTC).date().isoformat(), "bytes": 100})
+    )
+    mock_get = mock_celestrak_response(text=ISS_CSV_RESPONSE)
+
+    with pytest.raises(CelesTrakVolumeBudgetExceeded):
+        fetch_omm_csv(norad_id=25544)
+
+    mock_get.assert_not_called()
+
+
+def test_volume_ledger_resets_on_a_new_utc_day(
+    isolated_settings, mock_celestrak_response, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Yesterday's spent budget must not block today's fetch."""
+    monkeypatch.setattr(isolated_settings, "daily_volume_budget_bytes", 100)
+    isolated_settings.state_dir.mkdir(parents=True)
+    yesterday = (datetime.now(UTC) - timedelta(days=1)).date().isoformat()
+    (isolated_settings.state_dir / "download_volume.json").write_text(
+        json.dumps({"date": yesterday, "bytes": 999_999})
+    )
+    mock_get = mock_celestrak_response(text=ISS_CSV_RESPONSE)
+
+    fetch_omm_csv(norad_id=25544)
+
+    mock_get.assert_called_once()
+
+
+# --- ingest() dispatch ---
+
+
+@pytest.mark.usefixtures("isolated_settings")
+def test_ingest_supports_groups(isolated_settings, mock_celestrak_response) -> None:
+    """`ingest` should accept a group target, not only a NORAD ID."""
+    mock_get = mock_celestrak_response(text=ISS_CSV_RESPONSE)
+
+    path = ingest(group="starlink")
+
+    assert mock_get.call_args.kwargs["params"] == {"GROUP": "starlink", "FORMAT": "CSV"}
+    _assert_landing_filename(path, isolated_settings.bronze_dir, "starlink", ".csv")
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{}, {"norad_id": 25544, "group": "starlink"}], ids=["neither", "both"]
+)
+def test_ingest_requires_exactly_one_target(kwargs: dict) -> None:
+    """`ingest` must reject an ambiguous or empty target."""
+    with pytest.raises(ValueError, match="exactly one"):
+        ingest(**kwargs)

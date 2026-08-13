@@ -3,11 +3,12 @@
 ## Overview
 
 `sat-tracker` ingests satellite orbital-element data (OMM records) from
-CelesTrak and lands it in a local **bronze** layer, preserving the raw
-payload byte-for-byte alongside structured audit metadata. This is the
-first stage of a medallion architecture; a silver layer (cleaned,
-deduplicated, schema-conformed data suitable for analysis) is the next
-planned milestone and is not yet implemented.
+CelesTrak, lands it in a local **bronze** layer, preserves the raw
+payload byte-for-byte alongside structured audit metadata, and stores
+the data in a partitioned Parquet dataset that is loaded idempotently
+into Postgres. This is the first stage of a medallion architecture; a
+silver layer (cleaned, deduplicated, schema-conformed data suitable for
+analysis) is the next planned milestone.
 
 ```
 CelesTrak GP endpoint
@@ -15,15 +16,24 @@ CelesTrak GP endpoint
         │  HTTP GET (CATNR=<norad_id> or GROUP=<name>, FORMAT=CSV|json)
         ▼
  CelesTrak Compliance Shield
+   ├─ identifying User-Agent
+   ├─ daily volume budget (halt before the request)
    ├─ cache check (skip HTTP if a landing file <2h old exists)
-   └─ fail-fast status gate (raise on any non-200, never retry)
+   ├─ conditional request (ETag → If-None-Match → 304 reuses cache)
+   └─ fail-fast status gate (only 200/304; never retry anything else)
         │
         ▼
    ┌────┴─────┐
    ▼          ▼
- bronze/     sds/
- *.csv       *.sds (OMM FlatBuffer)
- *.meta.json *.meta.json
+ bronze/     sds/                    ← raw landing, byte-for-byte
+ *.csv       *.sds                     + .meta.json audit sidecars
+        │
+        ▼  write_bronze_parquet()
+ bronze_parquet/                     ← columnar, ingest_date=/hour=
+ ingest_date=YYYY-MM-DD/hour=HH/*.parquet
+        │
+        ▼  load_bronze_to_postgres()
+ Postgres bronze.raw_gp              ← queryable, idempotent load
 ```
 
 ## Components
@@ -103,14 +113,52 @@ functions. Verbose (`INFO`-level) logging is the default; `--quiet`
 drops it to `WARNING`. Target selection (`--norad-id` vs `--group`) is a
 required mutually-exclusive group; `--format` selects `csv`/`sds`.
 
+## Storage layer
+
+### `sat_tracker.storage.parquet_writer`
+
+Reads a landed `.csv` plus its `.meta.json` sidecar and writes the rows
+into a Parquet dataset partitioned `ingest_date=YYYY-MM-DD/hour=HH`,
+prepending the lineage columns (`ingest_ts`, `ingestion_id`, `source`,
+`source_file`, `target`).
+
+**Every source column stays a string.** Bronze's contract is fidelity:
+a value CelesTrak sends that does not parse must survive the trip and
+fail loudly in a silver-layer test, rather than being coerced here.
+This is not hypothetical — CelesTrak began issuing six-digit NORAD IDs
+in July 2026, and type inference on a mixed catalogue is exactly the
+kind of thing that silently mangles them.
+
+A missing or malformed sidecar raises `MissingSidecarError` rather than
+loading unattributable rows.
+
+The destination is `settings.parquet_root`, resolved through
+`pyarrow.fs`. A plain path writes locally; an `s3://bucket/prefix` URI
+writes to S3 **with no other change anywhere in the pipeline** — which
+is what keeps the S3 migration off the critical path.
+
+### `sat_tracker.storage.postgres_loader`
+
+`COPY`s the Parquet rows into a temp staging table, then moves them
+across with `INSERT ... ON CONFLICT DO NOTHING`. `bronze.raw_gp`'s
+primary key is `(source, source_file, norad_cat_id)`, so **re-running a
+load is a no-op, not a duplicate** — the property that makes an Airflow
+retry safe.
+
+`COPY` is used rather than an ORM bulk insert because ~30,000 rows per
+full-catalogue fetch is exactly where row-by-row inserts start to hurt,
+and because it keeps SQLAlchemy out of the dependency tree entirely.
+
 ## Data flow (current state)
 
 ```
-CelesTrak ──▶ bronze/ (data/bronze/*.csv, data/sds/*.sds)
+CelesTrak ──▶ data/bronze/*.csv ──▶ data/bronze_parquet/ ──▶ bronze.raw_gp
+              data/sds/*.sds        (partitioned)            (Postgres)
 ```
 
-Both `data/` and `notebooks/` are gitignored — ingested data and ad hoc
-exploration notebooks are runtime/working artifacts, not source.
+`data/` and `notebooks/` are gitignored — ingested data, the Parquet
+dataset, the volume ledger and ad hoc notebooks are runtime artifacts,
+not source. `docker-compose.yml` and `sql/init/` are committed.
 
 ## Secrets
 
@@ -139,8 +187,17 @@ metadata sidecar's structure.
 
 ## Open follow-up work
 
-- Silver-layer curation (cleaning, deduplication, schema conformance)
-  from the bronze/sds landing zones — not yet started.
-- SDS batch/multi-record encoding for group ingestion.
-- No scheduling/orchestration yet — ingestion is run by hand via the
-  CLI; see [`docs/runbook.md`](docs/runbook.md).
+- **SATCAT ingest.** `gold.dim_object` needs `object_type`, `country`,
+  `launch_date` and `rcs_size_m2`, none of which are in the GP/OMM feed
+  — they come from CelesTrak's separate `satcat.php` endpoint. The
+  Payload/Rocket-Body/Debris classification stretch goal trains on
+  `object_type`, so it is blocked on this.
+- **dbt silver/gold.** `silver.elset` (dedup + SCD-2) and the gold
+  serving models.
+- **SGP4 propagation** into `gold.position_snapshot`.
+- **Airflow orchestration.** Deliberately last: every stage is already
+  a standalone CLI command, so the DAG is thin operators over commands
+  that work on their own. A scheduling problem then cannot masquerade
+  as a data problem.
+- **S3 flip.** Point `SAT_TRACKER_PARQUET_ROOT` at an `s3://` URI.
+- **Streamlit map** with on-demand `SatrecArray` propagation.

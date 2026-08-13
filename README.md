@@ -7,10 +7,13 @@ in a medallion-style bronze layer — either as raw CSV or as binary
 [SDS](https://spacedatastandards.org/) FlatBuffers — ready for curation
 into a silver layer.
 
-> **Status:** early-stage capstone project. The ingestion (bronze) layer
-> is implemented and tested; silver-layer curation is the next milestone.
-> See [`docs/architecture.md`](docs/architecture.md) for design details
-> and [`docs/runbook.md`](docs/runbook.md) for day-to-day operation.
+> **Status:** capstone project in progress. Ingestion (CelesTrak client),
+> the bronze layer (CSV/SDS landing), and the storage layer (partitioned
+> Parquet + idempotent Postgres loading) are implemented and tested; the
+> silver layer (dbt-built, deduplicated, SCD-2 historised element sets)
+> is the next milestone. See [`docs/architecture.md`](docs/architecture.md)
+> for design details and [`docs/runbook.md`](docs/runbook.md) for
+> day-to-day operation.
 
 ## Features
 
@@ -18,12 +21,16 @@ into a silver layer.
   CelesTrak group (e.g. `starlink`, `oneweb`, `gps-ops`).
 - Two output formats: compact `OMM-CSV` (bronze) or binary `OMM`
   FlatBuffers via `spacedatastandards-org` (SDS).
-- **CelesTrak Compliance Shield**: a 2-hour local cache check before any
-  HTTP request, and fail-fast (no retry) on any non-200 response, to
-  avoid tripping CelesTrak's abuse detection.
+- **CelesTrak Compliance Shield** — an identifying User-Agent, a daily
+  download budget enforced before the request, a 2-hour local cache,
+  `ETag`/`If-None-Match` conditional requests, and fail-fast on any
+  status other than `200`/`304` with no retry. CelesTrak firewall-blocks
+  IPs that exceed 100 MB/day or hammer a blocking response.
 - Collision-free, auditable landing filenames
   (`<stem>_<ingested_at>_<ingestion_id><suffix>`) with a `.meta.json`
   sidecar per file.
+- Bronze Parquet dataset partitioned `ingest_date=/hour=`, loaded into
+  Postgres **idempotently** — re-running a load never duplicates rows.
 - Type-safe, environment-overridable configuration via
   `pydantic-settings`.
 
@@ -32,6 +39,7 @@ into a silver layer.
 - Python 3.12+
 - [`uv`](https://docs.astral.sh/uv/) for dependency and environment
   management (this project does not use `pip` directly)
+- Docker, for the local Postgres warehouse
 
 ## Quickstart
 
@@ -39,28 +47,38 @@ into a silver layer.
 # Install dependencies into a local .venv
 uv sync
 
+# Start the Postgres warehouse (published on 5433, not 5432)
+docker compose up -d
+
 # Run the test suite
 uv run pytest
 
-# Fetch a single satellite (ISS) as CSV into data/bronze/
-uv run sat-tracker-ingest --norad-id 25544 --format csv
+# Fetch a constellation and load it all the way into Postgres
+uv run sat-tracker-ingest --group starlink --format csv --load
 
-# Fetch an entire constellation as CSV into data/bronze/
-uv run sat-tracker-ingest --group starlink --format csv
+# Query what landed
+docker compose exec postgres psql -U sat_tracker -d sat_tracker -c \
+  "SELECT count(*), count(DISTINCT norad_cat_id) FROM bronze.raw_gp;"
 ```
 
 See [`docs/runbook.md`](docs/runbook.md) for the full command reference,
-including the SDS FlatBuffer format and log verbosity flags.
+including loading stages separately, the SDS FlatBuffer format, and
+troubleshooting.
 
 ## Project layout
 
 ```
 src/sat_tracker/
-├── config.py              # single pydantic-settings Settings singleton
-├── cli.py                 # `sat-tracker-ingest` entry point
-└── ingest/
-    └── celestrak_client.py  # CelesTrak GP client (bronze layer)
-tests/                     # pytest suite, mirrors src/ layout
+├── config.py                 # single pydantic-settings Settings singleton
+├── cli.py                    # ingest / load entry points
+├── ingest/
+│   └── celestrak_client.py   # CelesTrak GP client + compliance shield
+└── storage/
+    ├── parquet_writer.py     # bronze CSV → partitioned Parquet
+    └── postgres_loader.py    # Parquet → bronze.raw_gp (idempotent)
+sql/init/                     # schema + table DDL, run on first boot
+docker-compose.yml            # local Postgres warehouse
+tests/                        # pytest suite, mirrors src/ layout
 ```
 
 ## Configuration

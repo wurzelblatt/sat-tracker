@@ -7,11 +7,26 @@ pipeline. For design rationale, see [`architecture.md`](architecture.md).
 
 ```bash
 uv sync
+docker compose up -d      # Postgres warehouse
 ```
 
-This creates/updates `.venv` from `pyproject.toml`/`uv.lock`. Never use
-`pip` directly in this project — `uv` is the only supported way to
+`uv sync` creates/updates `.venv` from `pyproject.toml`/`uv.lock`. Never
+use `pip` directly in this project — `uv` is the only supported way to
 install or manage dependencies.
+
+The Postgres container publishes on **5433**, not the default 5432, so
+it will not collide with a system Postgres. Check it came up healthy:
+
+```bash
+docker compose ps
+docker compose exec postgres psql -U sat_tracker -d sat_tracker -c "\dn"
+```
+
+You should see the `bronze`, `silver` and `gold` schemas. They are
+created by `sql/init/`, which Postgres runs **only on first
+initialisation of an empty data volume** — if you change those files
+later you must `docker compose down -v` (destroys the data) or apply the
+change by hand.
 
 ## Running ingestion
 
@@ -45,6 +60,41 @@ list.
 > object CelesTrak returns for that group, because the `OMM` FlatBuffer
 > schema represents a single record. Use `--format csv` for bulk groups
 > until batch SDS encoding is implemented.
+
+### Loading into the warehouse
+
+Ingestion only lands raw files. Converting them to Parquet and loading
+them into Postgres is a separate command, so an orchestrator can retry
+either stage independently:
+
+```bash
+# Convert every bronze CSV to Parquet, then load into bronze.raw_gp
+uv run sat-tracker-load
+
+# Just one landing
+uv run sat-tracker-load --source-file starlink_20260807T201737187277Z_35874ee5-....csv
+
+# Load existing Parquet without re-converting the CSVs
+uv run sat-tracker-load --skip-parquet
+```
+
+Or fetch and load in one shot:
+
+```bash
+uv run sat-tracker-ingest --group starlink --format csv --load
+```
+
+Both loading paths are **idempotent**: `bronze.raw_gp`'s primary key is
+`(source, source_file, norad_cat_id)` and the insert uses
+`ON CONFLICT DO NOTHING`, so re-running reports `Loaded 0 new rows`
+rather than duplicating. That is what makes an Airflow retry safe.
+
+Query what landed:
+
+```bash
+docker compose exec postgres psql -U sat_tracker -d sat_tracker -c \
+  "SELECT count(*), count(DISTINCT norad_cat_id) FROM bronze.raw_gp;"
+```
 
 ### Logging verbosity
 
@@ -122,6 +172,31 @@ exists to prevent.
 CelesTrak responded `200` but returned an empty result (e.g. an invalid
 NORAD ID that CelesTrak doesn't reject outright). Double-check the
 NORAD ID or group name.
+
+### `CelesTrakVolumeBudgetExceeded`
+
+The pipeline has already downloaded `settings.daily_volume_budget_bytes`
+(default 80 MB) from CelesTrak today and has stopped **before** making a
+request, to stay clear of CelesTrak's 100 MB/day firewall block. The
+ledger is `data/state/download_volume.json` and resets at UTC midnight.
+
+Do not delete the ledger to get around this. If you legitimately need a
+larger budget, raise `SAT_TRACKER_DAILY_VOLUME_BUDGET_BYTES` — but the
+100 MB ceiling is CelesTrak's, not ours, and exceeding it gets your IP
+blocked.
+
+### `MissingSidecarError`
+
+A landed `.csv` has no readable `.meta.json` sidecar, so its rows have
+no ingestion timestamp or ID and cannot be partitioned or traced. This
+usually means the file was created by hand rather than by the ingest
+command. Re-fetch it rather than fabricating a sidecar.
+
+### Postgres connection refused
+
+Check the container is up (`docker compose ps`) and that nothing else
+holds port 5433. The DSN lives in `settings.postgres_dsn` and is
+overridable with `SAT_TRACKER_POSTGRES_DSN`.
 
 ### Tests
 

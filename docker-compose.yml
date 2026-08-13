@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: sat_tracker_postgres
+    environment:
+      POSTGRES_USER: sat_tracker
+      POSTGRES_PASSWORD: sat_tracker
+      POSTGRES_DB: sat_tracker
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Runs once, on first initialisation of an empty data volume.
+      - ./sql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sat_tracker -d sat_tracker"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
