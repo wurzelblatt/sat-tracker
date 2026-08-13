@@ -1,0 +1,90 @@
+version: 2
+
+models:
+  - name: elset
+    description: >
+      Deduplicated, SCD-2 historised orbital element sets, one row per
+      (norad_cat_id, epoch). valid_from/valid_to are derived from epoch
+      rather than from ingestion time, so validity reflects when the
+      orbit was measured, not when the pipeline happened to run.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - norad_cat_id
+              - epoch
+    columns:
+      - name: norad_cat_id
+        description: NORAD catalog number. Six digits since July 2026.
+        data_tests:
+          - not_null
+
+      - name: epoch
+        description: UTC instant this element set describes.
+        data_tests:
+          - not_null
+
+      - name: valid_from
+        description: Start of this element set's authority. Equals epoch.
+        data_tests:
+          - not_null
+
+      - name: valid_to
+        description: >
+          Epoch of the next element set for this satellite; NULL for the
+          current one. Nullable by design.
+
+      - name: is_current
+        description: True for the newest element set per satellite.
+        data_tests:
+          - not_null
+
+      - name: eccentricity
+        description: >
+          Orbital eccentricity. Bounded [0, 1) — a value at or above 1
+          is a parabolic/hyperbolic trajectory, i.e. bad data rather
+          than an Earth orbit.
+        data_tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: ">= 0 and eccentricity < 1"
+
+      - name: inclination
+        description: Orbital inclination in degrees, bounded [0, 180].
+        data_tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: ">= 0 and inclination <= 180"
+
+      - name: ra_of_asc_node
+        description: Right ascension of the ascending node, degrees [0, 360).
+        data_tests:
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: ">= 0 and ra_of_asc_node < 360"
+
+      - name: arg_of_pericenter
+        description: Argument of pericenter, degrees [0, 360).
+        data_tests:
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: ">= 0 and arg_of_pericenter < 360"
+
+      - name: mean_anomaly
+        description: Mean anomaly, degrees [0, 360).
+        data_tests:
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: ">= 0 and mean_anomaly < 360"
+
+      - name: mean_motion
+        description: >
+          Revolutions per day. Positive, and below ~20 for any object
+          actually in orbit rather than re-entering.
+        data_tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: "> 0 and mean_motion < 20"

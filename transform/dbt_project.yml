@@ -1,0 +1,33 @@
+name: "sat_tracker"
+version: "0.1.0"
+config-version: 2
+
+profile: "sat_tracker"
+
+model-paths: ["models"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  sat_tracker:
+    staging:
+      # Views: staging only renames and casts, so there is nothing to
+      # persist. Keeping it a view means it can never go stale/outdated relative
+      # to bronze.
+      +materialized: view
+      +schema: staging
+    silver:
+      # Table, not incremental: The lead() that computes valid_to means
+      # a new epoch MUTATES/changes the valid_to entry in the previous row for that satellite,
+      # as it is still NULL up to this point in time, so this
+      # can not be an append-only model because incremental logic would have to search and
+      # reprocess each affected satellite's previous epochs. So it was opted for a
+      # complete rebuild. Even at ~1.3M rows this only takes seconds;
+      # correctness first, optimise if measured.
+      +materialized: table
+      +schema: silver

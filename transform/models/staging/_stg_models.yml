@@ -1,0 +1,21 @@
+version: 2
+
+models:
+  - name: stg_celestrak_gp
+    description: >
+      Bronze GP landings with real types. One row per satellite per
+      ingestion, so this still contains duplicates across fetches —
+      deduplication happens in silver.elset.
+    columns:
+      - name: norad_cat_id
+        description: NORAD catalog number, as an integer.
+        data_tests:
+          - not_null
+      - name: epoch
+        description: UTC instant the element set describes.
+        data_tests:
+          - not_null
+      - name: ingest_ts
+        description: When this row was fetched from CelesTrak.
+        data_tests:
+          - not_null

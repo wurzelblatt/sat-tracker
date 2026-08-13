@@ -7,13 +7,12 @@ in a medallion-style bronze layer — either as raw CSV or as binary
 [SDS](https://spacedatastandards.org/) FlatBuffers — ready for curation
 into a silver layer.
 
-> **Status:** capstone project in progress. Ingestion (CelesTrak client),
-> the bronze layer (CSV/SDS landing), and the storage layer (partitioned
-> Parquet + idempotent Postgres loading) are implemented and tested; the
-> silver layer (dbt-built, deduplicated, SCD-2 historised element sets)
-> is the next milestone. See [`docs/architecture.md`](docs/architecture.md)
-> for design details and [`docs/runbook.md`](docs/runbook.md) for
-> day-to-day operation.
+> **Status:** capstone project in progress. Ingestion, the bronze layer
+> and the dbt-built silver layer (`silver.elset`, deduplicated and SCD-2
+> historised) are implemented and tested; the gold layer and SGP4
+> propagation are the next milestone. See
+> [`docs/architecture.md`](docs/architecture.md) for design details and
+> [`docs/runbook.md`](docs/runbook.md) for day-to-day operation.
 
 ## Features
 
@@ -31,6 +30,10 @@ into a silver layer.
   sidecar per file.
 - Bronze Parquet dataset partitioned `ingest_date=/hour=`, loaded into
   Postgres **idempotently** — re-running a load never duplicates rows.
+- dbt-built `silver.elset`: deduplicated, SCD-2 historised element sets
+  where validity is derived from `epoch` (when the orbit was *measured*)
+  rather than ingestion time, guarded by custom tests for interval
+  contiguity and exactly-one-current-row-per-satellite.
 - Type-safe, environment-overridable configuration via
   `pydantic-settings`.
 
@@ -56,9 +59,13 @@ uv run pytest
 # Fetch a constellation and load it all the way into Postgres
 uv run sat-tracker-ingest --group starlink --format csv --load
 
+# Build the silver layer and run its tests
+uv run sat-tracker-transform --command deps   # first run only
+uv run sat-tracker-transform
+
 # Query what landed
 docker compose exec postgres psql -U sat_tracker -d sat_tracker -c \
-  "SELECT count(*), count(DISTINCT norad_cat_id) FROM bronze.raw_gp;"
+  "SELECT count(*), count(*) FILTER (WHERE is_current) FROM silver.elset;"
 ```
 
 See [`docs/runbook.md`](docs/runbook.md) for the full command reference,
@@ -70,12 +77,17 @@ troubleshooting.
 ```
 src/sat_tracker/
 ├── config.py                 # single pydantic-settings Settings singleton
-├── cli.py                    # ingest / load entry points
+├── cli.py                    # ingest / load / transform entry points
 ├── ingest/
 │   └── celestrak_client.py   # CelesTrak GP client + compliance shield
 └── storage/
     ├── parquet_writer.py     # bronze CSV → partitioned Parquet
     └── postgres_loader.py    # Parquet → bronze.raw_gp (idempotent)
+transform/                    # dbt project (in-repo profiles.yml)
+├── models/staging/           # stg_celestrak_gp — casts bronze TEXT → types
+├── models/silver/            # elset — dedup + SCD-2 historisation
+├── tests/                    # custom SCD-2 invariant tests
+└── macros/                   # literal schema naming
 sql/init/                     # schema + table DDL, run on first boot
 docker-compose.yml            # local Postgres warehouse
 tests/                        # pytest suite, mirrors src/ layout

@@ -6,9 +6,10 @@
 CelesTrak, lands it in a local **bronze** layer, preserves the raw
 payload byte-for-byte alongside structured audit metadata, and stores
 the data in a partitioned Parquet dataset that is loaded idempotently
-into Postgres. This is the first stage of a medallion architecture; a
-silver layer (cleaned, deduplicated, schema-conformed data suitable for
-analysis) is the next planned milestone.
+into Postgres. dbt then builds a **silver** layer — deduplicated,
+SCD-2 historised element sets — on top of it. This is the medallion
+architecture through silver; a **gold** layer of serving models and
+SGP4-propagated positions is the next planned milestone.
 
 ```
 CelesTrak GP endpoint
@@ -34,6 +35,13 @@ CelesTrak GP endpoint
         │
         ▼  load_bronze_to_postgres()
  Postgres bronze.raw_gp              ← queryable, idempotent load
+        │
+        ▼  dbt: stg_celestrak_gp (view, casts TEXT → real types)
+        ▼  dbt: silver.elset (table, dedup + SCD-2)
+ silver.elset
+        │
+        ▼  dbt (next milestone)
+ gold.dim_object / fact_latest_elset / position_snapshot
 ```
 
 ## Components
@@ -149,16 +157,113 @@ retry safe.
 full-catalogue fetch is exactly where row-by-row inserts start to hurt,
 and because it keeps SQLAlchemy out of the dependency tree entirely.
 
+## Silver layer (`transform/`, dbt)
+
+### `stg_celestrak_gp` (view)
+
+Casts bronze's all-`TEXT` columns to real types. Casts are deliberately
+plain — a safe-cast wrapper returning `NULL` on failure would turn a
+CelesTrak format change into thousands of silently-null orbital
+elements, whereas a hard cast turns it into a red build.
+
+### `silver.elset` (table)
+
+One row per `(norad_cat_id, epoch)`, deduplicated and SCD-2 historised.
+
+**Why no `dbt snapshot`.** Snapshots exist to reconstruct history that a
+*mutable* source fails to record. This source is not mutable: CelesTrak
+never revises the element set for a given `(satellite, epoch)` — it
+publishes a *new* one with a *new* epoch. History is not lost and
+awaiting reconstruction; **history is the data**. Every SCD-2 column is
+therefore a pure function of rows already present:
+
+```sql
+valid_from = epoch
+valid_to   = lead(epoch) over (partition by norad_cat_id order by epoch)
+is_current = valid_to is null
+```
+
+This is not a shortcut, it is more correct. A snapshot's
+`dbt_valid_from` records *when we fetched*, whereas validity is
+physically defined by *when the orbit was measured* (`epoch`).
+Snapshotting would conflate the two, and a missed pipeline run would
+silently corrupt the intervals. The model is also fully rebuildable
+from bronze at any time and always converges to the same answer.
+
+**Why `table`, not `incremental`.** The `lead()` means a newly arriving
+epoch *mutates the previous row's* `valid_to` for that satellite. That
+is not an append, so incremental logic would have to reprocess each
+affected satellite's tail — a classic source of silent correctness
+bugs. At realistic volume (~30k satellites × ~3 epochs/day) a full
+rebuild is seconds.
+
+**Deduplication.** Every 2h fetch re-lands the whole constellation, but
+CelesTrak only publishes new element sets a few times a day, so the same
+`(norad_cat_id, epoch)` arrives many times. Silver keeps the earliest
+`ingest_ts` — payloads are identical, and first-seen is the honest
+answer to "when did this enter our system?".
+
+**Schema naming.** `macros/generate_schema_name.sql` overrides dbt's
+default, which would concatenate the target schema with the model's
+custom schema and write to `public_silver`. The medallion layer names
+are part of the contract with everything downstream, so dbt must not
+rename them.
+
+### Tests
+
+Beyond range assertions on the orbital elements, two custom singular
+tests guard the SCD-2 logic specifically — the part most likely to
+break silently:
+
+- `assert_one_current_elset_per_satellite` — zero current rows means a
+  broken partition; more than one means duplicate epochs survived
+  deduplication.
+- `assert_validity_intervals_are_contiguous` — each `valid_to` must
+  equal the next `valid_from`. If this breaks, an "orbit as of time T"
+  lookup either matches nothing or matches two element sets, and the
+  failure surfaces downstream as a wrong satellite position rather than
+  as a loud error.
+
+### Deviations from `data-model.md`
+
+`data-model.md` specifies `NUMERIC(10, 8)` for the orbital elements.
+That permits only **two integer digits** (max `99.99999999`), and four
+columns exceed it: `ra_of_asc_node`, `arg_of_pericenter` and
+`mean_anomaly` all reach ~360, and `inclination` reaches 180. Verified
+against real data — Postgres rejects it outright:
+
+```
+ERROR:  numeric field overflow
+DETAIL:  A field with precision 10, scale 8 must round to an absolute
+         value less than 10^2.
+```
+
+Angular columns therefore use `NUMERIC(12, 8)`. `object_name` is `TEXT`
+rather than `VARCHAR(50)`; Postgres gains nothing from the length cap.
+
+### Deviation from `data-model.md`
+
+That document's bronze sketch lists `epoch_year`, `epoch_day`,
+`tle_line1` and `tle_line2`. The OMM-CSV feed carries **none** of them:
+it has a single ISO `EPOCH` timestamp, and TLE line pairs exist only in
+the legacy TLE format that six-digit NORAD IDs are phasing out.
+`bronze.raw_gp` therefore mirrors the 17 columns CelesTrak actually
+sends, rather than carrying four permanently-NULL columns.
+
 ## Data flow (current state)
 
 ```
 CelesTrak ──▶ data/bronze/*.csv ──▶ data/bronze_parquet/ ──▶ bronze.raw_gp
               data/sds/*.sds        (partitioned)            (Postgres)
+                                                                    │
+                                                                    ▼  dbt
+                                                              silver.elset
 ```
 
 `data/` and `notebooks/` are gitignored — ingested data, the Parquet
 dataset, the volume ledger and ad hoc notebooks are runtime artifacts,
-not source. `docker-compose.yml` and `sql/init/` are committed.
+not source. `docker-compose.yml`, `sql/init/` and `transform/` are
+committed.
 
 ## Secrets
 
@@ -192,8 +297,8 @@ metadata sidecar's structure.
   — they come from CelesTrak's separate `satcat.php` endpoint. The
   Payload/Rocket-Body/Debris classification stretch goal trains on
   `object_type`, so it is blocked on this.
-- **dbt silver/gold.** `silver.elset` (dedup + SCD-2) and the gold
-  serving models.
+- **dbt gold layer.** Serving models (`dim_object`, `fact_latest_elset`)
+  on top of the now-implemented `silver.elset`.
 - **SGP4 propagation** into `gold.position_snapshot`.
 - **Airflow orchestration.** Deliberately last: every stage is already
   a standalone CLI command, so the DAG is thin operators over commands

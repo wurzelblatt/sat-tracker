@@ -1,0 +1,5 @@
+packages:
+  # Provides expression_is_true (range assertions on orbital elements)
+  # and recency (staleness check against CelesTrak's 2h update cycle).
+  - package: dbt-labs/dbt_utils
+    version: [">=1.3.0", "<2.0.0"]

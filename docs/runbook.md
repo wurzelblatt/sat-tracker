@@ -96,6 +96,47 @@ docker compose exec postgres psql -U sat_tracker -d sat_tracker -c \
   "SELECT count(*), count(DISTINCT norad_cat_id) FROM bronze.raw_gp;"
 ```
 
+### Building the silver layer (dbt)
+
+Transformation is a third separate stage:
+
+```bash
+# Build every model and run its tests
+uv run sat-tracker-transform
+
+# Just the silver model and its tests
+uv run sat-tracker-transform --select elset
+
+# Tests only, without rebuilding
+uv run sat-tracker-transform --command test
+```
+
+`build` (the default) runs each model **and its tests together**, so a
+model that produces bad data fails immediately rather than being tested
+as an afterthought. The command exits with dbt's own exit code, so a
+failed test fails the task — which is what makes it safe for Airflow to
+call later.
+
+First run on a fresh clone needs the dbt packages:
+
+```bash
+uv run sat-tracker-transform --command deps
+```
+
+To run dbt directly (for `dbt docs`, `dbt compile`, etc.), pass both
+directory flags, since the profile lives in-repo rather than `~/.dbt`:
+
+```bash
+uv run dbt build --project-dir transform --profiles-dir transform
+```
+
+Inspect the result:
+
+```bash
+docker compose exec postgres psql -U sat_tracker -d sat_tracker -c \
+  "SELECT count(*), count(*) FILTER (WHERE is_current) FROM silver.elset;"
+```
+
 ### Logging verbosity
 
 `INFO`-level logging (including compliance-shield decisions like cache

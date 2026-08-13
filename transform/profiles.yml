@@ -1,0 +1,25 @@
+# Kept in-repo rather than in ~/.dbt/profiles.yml so the project is
+# reviewable and reproducible on another machine. Every value is an
+# env_var with a default matching docker-compose.yml, so a fresh clone
+# works with no configuration, while a different environment (CI, or a
+# hosted Postgres once the app is deployed) only needs env vars set.
+#
+# There are no secrets here: the local Compose credentials are
+# throwaway. If this ever points at a real database, move the password
+# to SAT_TRACKER_POSTGRES_PASSWORD and set it outside version control.
+
+sat_tracker:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('SAT_TRACKER_POSTGRES_HOST', 'localhost') }}"
+      port: "{{ env_var('SAT_TRACKER_POSTGRES_PORT', '5433') | int }}"
+      user: "{{ env_var('SAT_TRACKER_POSTGRES_USER', 'sat_tracker') }}"
+      password: "{{ env_var('SAT_TRACKER_POSTGRES_PASSWORD', 'sat_tracker') }}"
+      dbname: "{{ env_var('SAT_TRACKER_POSTGRES_DB', 'sat_tracker') }}"
+      # Models declare their own schema (staging / silver / gold) and
+      # macros/generate_schema_name.sql makes that literal, so this
+      # value is only a fallback for anything unconfigured.
+      schema: public
+      threads: 4

@@ -28,6 +28,12 @@ notebooks/
 .ruff_cache/
 .ipynb_checkpoints/
 
+# dbt build artifacts and machine-local state
+transform/target/
+transform/dbt_packages/
+transform/logs/
+transform/.user.yml
+
 # Personal/local IDE config (machine-specific paths)
 .vscode/
 

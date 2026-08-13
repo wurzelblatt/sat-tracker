@@ -4,6 +4,7 @@ Each pipeline stage is a separate, independently runnable command:
 
 - ``sat-tracker-ingest`` fetches from CelesTrak into the bronze landing zone
 - ``sat-tracker-load`` converts landed CSV to Parquet and loads it to Postgres
+- ``sat-tracker-transform`` builds the dbt silver/gold models and tests them
 
 Keeping the stages separate is deliberate. An orchestrator (Airflow)
 should call commands that already work standalone, so a scheduling
@@ -13,6 +14,9 @@ demoable even if the scheduler is down.
 
 import argparse
 import logging
+import subprocess
+import sys
+from pathlib import Path
 
 from sat_tracker.config import settings
 from sat_tracker.ingest.celestrak_client import (
@@ -132,6 +136,49 @@ def load() -> None:
 
     inserted = load_bronze_to_postgres(source_file=args.source_file)
     print(f"Loaded {inserted} new rows into bronze.raw_gp")
+
+
+def transform() -> None:
+    """Build and test the dbt models over the loaded bronze data."""
+    parser = argparse.ArgumentParser(
+        description="Run the dbt transformations that build the silver and gold layers."
+    )
+    parser.add_argument(
+        "--select",
+        help="dbt node selector, e.g. 'silver.elset' or 'staging'. Defaults to everything.",
+    )
+    parser.add_argument(
+        "--command",
+        default="build",
+        choices=["build", "run", "test", "deps"],
+        help="dbt subcommand to invoke. 'build' (the default) runs models and their "
+        "tests together, so a model that produces bad data fails immediately rather "
+        "than being tested as an afterthought.",
+    )
+    _add_verbosity_flag(parser)
+    args = parser.parse_args()
+
+    _configure_logging(args.quiet)
+
+    # The dbt project keeps its own profiles.yml in-repo, so neither the
+    # caller nor a future Airflow worker needs a ~/.dbt directory.
+    project_dir = Path(__file__).resolve().parents[2] / "transform"
+    command = [
+        "dbt",
+        args.command,
+        "--project-dir",
+        str(project_dir),
+        "--profiles-dir",
+        str(project_dir),
+    ]
+    if args.select:
+        command += ["--select", args.select]
+
+    # check=False so the dbt exit code propagates as-is: a failed test
+    # must fail the task, not raise a Python traceback over the top of
+    # dbt's own far more useful output.
+    result = subprocess.run(command, check=False)
+    sys.exit(result.returncode)
 
 
 if __name__ == "__main__":

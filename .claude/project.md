@@ -80,6 +80,25 @@ Celestrak GP/OMM → Airflow (tenacity, ETag) → S3 Bronze (raw)
 4. Fancy visualization (simple 2D map)
 5. **NEVER cut:** working ingest + queryable storage + running Streamlit map
 
+## Deferred Decision: Historical Retention (Bronze/Silver SCD-2)
+
+Bronze keeps every raw landing; Silver's `elset` is fully SCD-2 historized
+(all past epochs kept, chained via `valid_from`/`valid_to`/`is_current`)
+rather than latest-only. This costs nothing extra to build — it's the
+natural output of computing SCD-2 as a pure function of epoch, not a
+separate snapshot mechanism (see `reports/step2-silver-layer.md`) — so it
+was kept by default.
+
+**However, none of the three roadmap deliverables actually require it:**
+- On-demand SGP4 propagation (Streamlit map) only needs the latest elset per satellite.
+- Collision screening (SOCRATES/APSIS) only screens current orbits.
+- ML classification (Payload/Rocket-Body/Debris) predicts a static label from a single current snapshot; historical epochs would only matter as *optional* engineered features (BSTAR/mean-motion drift as decay signals), which is not in current scope.
+
+**Candidate cut, if time/disk pressure hits:** collapse bronze/silver to
+latest-elset-only. Would not break the map, collision alert, or ML
+classifier as currently scoped. Revisit only if this becomes a real
+constraint — not acted on as of 2026-08-13.
+
 ## Caveats
 - **SGP4 accuracy:** TLE/GP positions deviate by ~1–3 km/day (data accuracy, not algorithm)
 - **Space-Track redistribution:** Raw data cannot be publicly committed (US Data-Use Agreement)

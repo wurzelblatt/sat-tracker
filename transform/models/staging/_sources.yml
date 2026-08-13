@@ -1,0 +1,34 @@
+version: 2
+
+sources:
+  - name: bronze
+    description: >
+      Raw CelesTrak GP/OMM landings, loaded from the partitioned Parquet
+      dataset. Every payload column is TEXT by design: bronze's contract
+      is fidelity, so a value CelesTrak sends that does not parse must
+      land intact and fail loudly in a silver test rather than be
+      coerced here.
+    schema: bronze
+    tables:
+      - name: raw_gp
+        description: One row per satellite per ingestion.
+        loaded_at_field: ingest_ts
+        freshness:
+          # CelesTrak only recomputes GP data every 2h and the client
+          # caches for that long, so anything older than ~4h means the
+          # pipeline has missed at least one cycle.
+          warn_after: {count: 4, period: hour}
+          error_after: {count: 12, period: hour}
+        columns:
+          - name: norad_cat_id
+            description: NORAD catalog number. Six digits since July 2026.
+            data_tests:
+              - not_null
+          - name: epoch
+            description: UTC timestamp the element set describes, ISO 8601.
+            data_tests:
+              - not_null
+          - name: source_file
+            description: Landing file the row came from; part of the bronze PK.
+            data_tests:
+              - not_null
