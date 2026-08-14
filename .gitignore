@@ -37,8 +37,9 @@ transform/.user.yml
 # Personal/local IDE config (machine-specific paths)
 .vscode/
 
-# Personal Claude Code permission overrides (local only)
-.claude/settings.local.json
+# Personal Claude Code permissions and instructions (local only)
+.claude/
+.claude-instructions.md
 
 # Working notes, not part of the shipped project
 plans/

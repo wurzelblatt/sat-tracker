@@ -7,6 +7,7 @@ from pathlib import Path
 import pyarrow.dataset as ds
 import pytest
 
+from sat_tracker.config import settings
 from sat_tracker.storage.parquet_writer import MissingSidecarError, write_bronze_parquet
 
 
@@ -18,9 +19,7 @@ def landed_csv(
     sample_ingested_at: str,
 ) -> Path:
     """Write a landed CSV plus sidecar, with the Parquet root redirected to tmp_path."""
-    from sat_tracker.storage import parquet_writer
-
-    monkeypatch.setattr(parquet_writer.settings, "parquet_root", str(tmp_path / "parquet"))
+    monkeypatch.setattr(settings, "parquet_root", str(tmp_path / "parquet"))
 
     csv_path = tmp_path / "bronze" / "starlink_20260807T201737187277Z_test-id.csv"
     csv_path.parent.mkdir(parents=True)

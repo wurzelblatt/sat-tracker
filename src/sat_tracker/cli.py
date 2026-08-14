@@ -2,7 +2,8 @@
 
 Each pipeline stage is a separate, independently runnable command:
 
-- ``sat-tracker-ingest`` fetches from CelesTrak into the bronze landing zone
+- ``sat-tracker-ingest`` fetches GP/OMM element sets into the bronze landing zone
+- ``sat-tracker-satcat`` fetches the SATCAT object catalogue into the same zone
 - ``sat-tracker-load`` converts landed CSV to Parquet and loads it to Postgres
 - ``sat-tracker-transform`` builds the dbt silver/gold models and tests them
 
@@ -18,13 +19,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-from sat_tracker.config import settings
 from sat_tracker.ingest.celestrak_client import (
     fetch_omm_csv,
     fetch_omm_csv_group,
     fetch_omm_sds,
     fetch_omm_sds_group,
+    fetch_satcat,
 )
+from sat_tracker.storage.datasets import ALL_DATASETS, GP, SATCAT
 from sat_tracker.storage.parquet_writer import write_bronze_parquet
 from sat_tracker.storage.postgres_loader import load_bronze_to_postgres
 
@@ -96,7 +98,33 @@ def main() -> None:
             return
         write_bronze_parquet(path)
         inserted = load_bronze_to_postgres(source_file=path.name)
-        print(f"Loaded {inserted} new rows into bronze.raw_gp")
+        print(f"Loaded {inserted} new rows into {GP.table}")
+
+
+def satcat() -> None:
+    """Fetch the CelesTrak SATCAT catalogue into bronze, optionally loading it."""
+    parser = argparse.ArgumentParser(
+        description="Fetch CelesTrak's full SATCAT object catalogue into the local "
+        "bronze landing zone."
+    )
+    parser.add_argument(
+        "--load",
+        action="store_true",
+        help="After fetching, also convert the landed CSV to Parquet and load it into "
+        "Postgres.",
+    )
+    _add_verbosity_flag(parser)
+    args = parser.parse_args()
+
+    _configure_logging(args.quiet)
+
+    path = fetch_satcat()
+    print(f"Wrote {path}")
+
+    if args.load:
+        write_bronze_parquet(path, SATCAT)
+        inserted = load_bronze_to_postgres(source_file=path.name, dataset=SATCAT)
+        print(f"Loaded {inserted} new rows into {SATCAT.table}")
 
 
 def load() -> None:
@@ -107,7 +135,12 @@ def load() -> None:
     parser.add_argument(
         "--source-file",
         help="Name of a single landed CSV to process (e.g. 'starlink_2026...csv'). "
-        "Defaults to every CSV in the bronze landing zone.",
+        "Defaults to every CSV in every bronze landing zone.",
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=[dataset.name for dataset in ALL_DATASETS],
+        help="Restrict the run to one bronze feed. Defaults to all of them.",
     )
     parser.add_argument(
         "--skip-parquet",
@@ -120,22 +153,29 @@ def load() -> None:
 
     _configure_logging(args.quiet)
 
-    if not args.skip_parquet:
-        if args.source_file:
-            csv_paths = [settings.bronze_dir / args.source_file]
-        else:
-            csv_paths = sorted(settings.bronze_dir.glob("*.csv"))
+    selected = [d for d in ALL_DATASETS if args.dataset in (None, d.name)]
 
-        if not csv_paths:
-            print(f"No CSV landings found in {settings.bronze_dir}")
-            return
+    for dataset in selected:
+        if not args.skip_parquet:
+            if args.source_file:
+                candidate = dataset.landing_dir / args.source_file
+                csv_paths = [candidate] if candidate.exists() else []
+            else:
+                csv_paths = sorted(dataset.landing_dir.glob("*.csv"))
 
-        for csv_path in csv_paths:
-            write_bronze_parquet(csv_path)
-            print(f"Converted {csv_path.name}")
+            if not csv_paths:
+                print(f"No {dataset.name} CSV landings found in {dataset.landing_dir}")
+                # Skipping the load too: with nothing converted there is
+                # nothing new to insert, and running it anyway would
+                # rescan the whole Parquet dataset to insert zero rows.
+                continue
 
-    inserted = load_bronze_to_postgres(source_file=args.source_file)
-    print(f"Loaded {inserted} new rows into bronze.raw_gp")
+            for csv_path in csv_paths:
+                write_bronze_parquet(csv_path, dataset)
+                print(f"Converted {csv_path.name}")
+
+        inserted = load_bronze_to_postgres(source_file=args.source_file, dataset=dataset)
+        print(f"Loaded {inserted} new rows into {dataset.table}")
 
 
 def transform() -> None:

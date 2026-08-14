@@ -14,6 +14,13 @@ and persists it locally in one of two formats selected by
   FlatBuffers using the `OMM` schema from the `spacedatastandards-org`
   package and written to ``settings.sds_dir``.
 
+`fetch_satcat` additionally pulls CelesTrak's full SATCAT dump — the
+descriptive catalogue (object type, owner, launch, decay) that the gold
+`dim_object` dimension is built from. It is served from a different URL
+and refreshed daily rather than continuously, so it is fetched with its
+own longer cache window, but is otherwise governed by the same policy
+and runs through the same shield.
+
 A "CelesTrak Compliance Shield" wraps every fetch to keep the pipeline
 from being IP-banned by CelesTrak:
 
@@ -61,6 +68,10 @@ logger = logging.getLogger(__name__)
 _CACHE_TTL = timedelta(hours=2)
 _VOLUME_LEDGER_FILENAME = "download_volume.json"
 _SOURCE_NAME = "celestrak"
+
+# Filename stem for SATCAT landings. Distinct from any GP group name, so
+# the two feeds never collide in the shared bronze landing zone.
+_SATCAT_STEM = "satcat"
 
 # FlatBuffers size prefixes are 4-byte unsigned offsets preceding each record.
 _SIZE_PREFIX_BYTES = 4
@@ -202,9 +213,9 @@ def _record_downloaded_bytes(count: int) -> None:
 
 
 def _get_celestrak(
-    params: dict[str, int | str], *, etag: str | None = None
+    params: dict[str, int | str], *, etag: str | None = None, url: str | None = None
 ) -> requests.Response:
-    """Query the CelesTrak GP endpoint under the full compliance shield.
+    """Query a CelesTrak endpoint under the full compliance shield.
 
     Checks the daily volume budget, sends an identifying User-Agent and
     an optional conditional-request header, enforces the fail-fast status
@@ -212,10 +223,14 @@ def _get_celestrak(
 
     Args:
         params: Query parameters to send, e.g. ``{"CATNR": 25544,
-            "FORMAT": "CSV"}``.
+            "FORMAT": "CSV"}``. Empty for endpoints that serve a static
+            file, such as the SATCAT dump.
         etag: ``ETag`` from a previous fetch of the same target, replayed
             as ``If-None-Match`` so CelesTrak can answer ``304 Not
             Modified`` instead of resending an unchanged payload.
+        url: Endpoint to query. Defaults to the GP endpoint; the SATCAT
+            dump is served from a different URL but is governed by the
+            same usage policy, so it goes through this same shield.
 
     Returns:
         The HTTP response, guaranteed to be either ``200`` or ``304``.
@@ -239,7 +254,7 @@ def _get_celestrak(
         headers["If-None-Match"] = etag
 
     response = session.get(
-        settings.celestrak_url, params=params, headers=headers, timeout=10
+        url or settings.celestrak_url, params=params, headers=headers, timeout=10
     )
 
     if response.status_code not in (200, 304):
@@ -365,23 +380,27 @@ def _fetch_and_cache(
     stem: str,
     suffix: str,
     not_found_label: str,
+    url: str | None = None,
+    ttl: timedelta = _CACHE_TTL,
 ) -> Path:
     """Run the shared cache-check, conditional-fetch and write flow.
 
-    Both the CSV and SDS paths differ only in how a ``200`` payload is
-    turned into bytes, so everything up to that point — cache
-    freshness, `ETag` replay, `304` handling, and the empty-response
-    check — lives here.
+    Every feed differs only in how a ``200`` payload is turned into
+    bytes, so everything up to that point — cache freshness, `ETag`
+    replay, `304` handling, and the empty-response check — lives here.
 
     Args:
-        params: Query parameters for the CelesTrak GP request.
+        params: Query parameters for the CelesTrak request.
         directory: Landing zone to read the cache from and write to.
-        stem: The NORAD ID or group name keying the filename and cache
-            lookup.
+        stem: The NORAD ID, group name or feed name keying the filename
+            and cache lookup.
         suffix: File extension, e.g. `".csv"` or `".sds"`.
         not_found_label: Human-readable description of what was
             requested, used in the `ValueError` message if CelesTrak has
             no matching data.
+        url: Endpoint to query. Defaults to the GP endpoint.
+        ttl: How long a cached landing stays fresh before a new request
+            is made. Defaults to the GP feed's 2-hour policy window.
 
     Returns:
         The path of the cached or newly written file.
@@ -392,21 +411,24 @@ def _fetch_and_cache(
         ValueError: If CelesTrak returns no data for the request.
     """
     cached = _find_latest_landing_file(directory, stem, suffix)
-    if cached is not None and _is_cache_fresh(cached):
-        logger.info("Using cached local data (under 2 hours old)")
+    if cached is not None and _is_cache_fresh(cached, ttl=ttl):
+        logger.info("Using cached local data (under %g hours old)", ttl.total_seconds() / 3600)
         return cached
 
     etag = _read_sidecar(cached).get("etag") if cached is not None else None
-    response = _get_celestrak(params, etag=etag)
+    response = _get_celestrak(params, etag=etag, url=url)
 
     if response.status_code == 304 and cached is not None:
         logger.info("CelesTrak reports data unchanged (HTTP 304); reusing cached file")
-        # Reset the 2h TTL window: the cached bytes are confirmed current.
+        # Reset the TTL window: the cached bytes are confirmed current.
         cached.touch()
         return cached
 
     if suffix == ".csv":
-        if not response.content or response.text.strip().startswith("No GP data found"):
+        # Checked against the raw bytes rather than `response.text`,
+        # which would decode the whole payload — 6.7 MB for the SATCAT
+        # dump — just to look at its first few characters.
+        if not response.content or response.content[:64].lstrip().startswith(b"No GP data found"):
             raise ValueError(f"No OMM data found for {not_found_label}")
         data = response.content
     else:
@@ -475,6 +497,42 @@ def fetch_omm_csv_group(group: str) -> Path:
         stem=group,
         suffix=".csv",
         not_found_label=f"CelesTrak group '{group}'",
+    )
+
+
+def fetch_satcat() -> Path:
+    """Fetch CelesTrak's full SATCAT dump and land it in the bronze zone.
+
+    The SATCAT is the descriptive catalogue behind the orbital element
+    sets: object type, owner, launch date and site, decay date, and
+    orbital regime. It is what turns a NORAD ID in the fact table into
+    something a human can read, and it is deliberately the *full* dump
+    rather than a filtered query — a satellite that decays between a
+    SATCAT pull and a GP pull must still resolve in `gold.dim_object`,
+    which a query filtered to currently-active objects would not
+    guarantee.
+
+    Skips the HTTP request and returns the existing file if a cached
+    copy under `settings.satcat_cache_ttl_hours` old is already present.
+    CelesTrak rebuilds the dump about once a day, so a shorter window
+    would only re-download identical bytes.
+
+    Returns:
+        The path of the `.csv` file, under `settings.satcat_dir`.
+
+    Raises:
+        CelesTrakFatalError: If CelesTrak responds with a fatal status,
+            or today's download budget is spent.
+        ValueError: If CelesTrak returns an empty catalogue.
+    """
+    return _fetch_and_cache(
+        {},
+        directory=settings.satcat_dir,
+        stem=_SATCAT_STEM,
+        suffix=".csv",
+        not_found_label="the CelesTrak SATCAT",
+        url=settings.celestrak_satcat_url,
+        ttl=timedelta(hours=settings.satcat_cache_ttl_hours),
     )
 
 

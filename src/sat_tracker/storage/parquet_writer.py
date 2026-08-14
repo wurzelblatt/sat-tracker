@@ -12,7 +12,7 @@ a value CelesTrak sends that does not parse must survive the trip and
 fail loudly in a silver-layer test, rather than being coerced or
 dropped here. dbt does the casting downstream.
 
-The destination is `settings.parquet_root`, resolved through
+The destination is the dataset's Parquet root, resolved through
 `pyarrow.fs`. A plain path writes locally; an ``s3://bucket/prefix``
 URI writes to S3 with no other change anywhere in the pipeline.
 """
@@ -28,7 +28,7 @@ import pyarrow.csv as pa_csv
 import pyarrow.fs as pa_fs
 import pyarrow.parquet as pq
 
-from sat_tracker.config import settings
+from sat_tracker.storage.datasets import GP, BronzeDataset
 
 logger = logging.getLogger(__name__)
 
@@ -110,13 +110,15 @@ def _read_csv_as_strings(csv_path: Path) -> pa.Table:
     return table.rename_columns([name.lower() for name in header])
 
 
-def write_bronze_parquet(csv_path: Path) -> str:
-    """Write one landed CSV into the partitioned bronze Parquet dataset.
+def write_bronze_parquet(csv_path: Path, dataset: BronzeDataset = GP) -> str:
+    """Write one landed CSV into a partitioned bronze Parquet dataset.
 
     Args:
         csv_path: Path of a `.csv` file in the bronze landing zone, as
             returned by `sat_tracker.ingest.celestrak_client.fetch_omm_csv`
             and friends.
+        dataset: Which bronze feed this landing belongs to, selecting the
+            Parquet root it is written under. Defaults to the GP/OMM feed.
 
     Returns:
         The dataset root the rows were written under.
@@ -147,7 +149,10 @@ def write_bronze_parquet(csv_path: Path) -> str:
     # add_column(0, ...) in reverse order leaves lineage first, in
     # declaration order, with the payload columns following.
 
-    filesystem, root_path = _resolve_filesystem(settings.parquet_root)
+    # Resolved once so the log line and return value cannot disagree
+    # with what was written if settings change mid-call.
+    parquet_root = dataset.parquet_root
+    filesystem, root_path = _resolve_filesystem(parquet_root)
     pq.write_to_dataset(
         table,
         root_path=root_path,
@@ -163,8 +168,8 @@ def write_bronze_parquet(csv_path: Path) -> str:
     logger.info(
         "Wrote %d rows to %s (ingest_date=%s/hour=%s)",
         row_count,
-        settings.parquet_root,
+        parquet_root,
         f"{ingest_ts:%Y-%m-%d}",
         f"{ingest_ts:%H}",
     )
-    return settings.parquet_root
+    return parquet_root

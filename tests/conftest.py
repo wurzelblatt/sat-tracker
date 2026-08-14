@@ -53,6 +53,7 @@ def isolated_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Settin
     tests would leak state into one another.
     """
     monkeypatch.setattr(celestrak_client.settings, "bronze_dir", tmp_path / "bronze")
+    monkeypatch.setattr(celestrak_client.settings, "satcat_dir", tmp_path / "satcat")
     monkeypatch.setattr(celestrak_client.settings, "sds_dir", tmp_path / "sds")
     monkeypatch.setattr(celestrak_client.settings, "state_dir", tmp_path / "state")
     return celestrak_client.settings

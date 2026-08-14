@@ -20,6 +20,7 @@ dependencies = [
 
 [project.scripts]
 sat-tracker-ingest = "sat_tracker.cli:main"
+sat-tracker-satcat = "sat_tracker.cli:satcat"
 sat-tracker-load = "sat_tracker.cli:load"
 sat-tracker-transform = "sat_tracker.cli:transform"
 
