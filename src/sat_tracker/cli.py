@@ -2,9 +2,11 @@
 
 Each pipeline stage is a separate, independently runnable command:
 
-- ``sat-tracker-ingest`` fetches from CelesTrak into the bronze landing zone
+- ``sat-tracker-ingest`` fetches GP/OMM element sets into the bronze landing zone
+- ``sat-tracker-satcat`` fetches the SATCAT object catalogue into the same zone
 - ``sat-tracker-load`` converts landed CSV to Parquet and loads it to Postgres
 - ``sat-tracker-transform`` builds the dbt silver/gold models and tests them
+- ``sat-tracker-propagate`` runs SGP4 and writes gold.position_snapshot
 
 Keeping the stages separate is deliberate. An orchestrator (Airflow)
 should call commands that already work standalone, so a scheduling
@@ -16,17 +18,21 @@ import argparse
 import logging
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
-from sat_tracker.config import settings
 from sat_tracker.ingest.celestrak_client import (
     fetch_omm_csv,
     fetch_omm_csv_group,
     fetch_omm_sds,
     fetch_omm_sds_group,
+    fetch_satcat,
 )
+from sat_tracker.propagate import elements
+from sat_tracker.storage.datasets import ALL_DATASETS, GP, SATCAT
 from sat_tracker.storage.parquet_writer import write_bronze_parquet
 from sat_tracker.storage.postgres_loader import load_bronze_to_postgres
+from sat_tracker.storage.snapshot_writer import write_position_snapshot
 
 
 def _add_verbosity_flag(parser: argparse.ArgumentParser) -> None:
@@ -96,7 +102,33 @@ def main() -> None:
             return
         write_bronze_parquet(path)
         inserted = load_bronze_to_postgres(source_file=path.name)
-        print(f"Loaded {inserted} new rows into bronze.raw_gp")
+        print(f"Loaded {inserted} new rows into {GP.table}")
+
+
+def satcat() -> None:
+    """Fetch the CelesTrak SATCAT catalogue into bronze, optionally loading it."""
+    parser = argparse.ArgumentParser(
+        description="Fetch CelesTrak's full SATCAT object catalogue into the local "
+        "bronze landing zone."
+    )
+    parser.add_argument(
+        "--load",
+        action="store_true",
+        help="After fetching, also convert the landed CSV to Parquet and load it into "
+        "Postgres.",
+    )
+    _add_verbosity_flag(parser)
+    args = parser.parse_args()
+
+    _configure_logging(args.quiet)
+
+    path = fetch_satcat()
+    print(f"Wrote {path}")
+
+    if args.load:
+        write_bronze_parquet(path, SATCAT)
+        inserted = load_bronze_to_postgres(source_file=path.name, dataset=SATCAT)
+        print(f"Loaded {inserted} new rows into {SATCAT.table}")
 
 
 def load() -> None:
@@ -107,7 +139,12 @@ def load() -> None:
     parser.add_argument(
         "--source-file",
         help="Name of a single landed CSV to process (e.g. 'starlink_2026...csv'). "
-        "Defaults to every CSV in the bronze landing zone.",
+        "Defaults to every CSV in every bronze landing zone.",
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=[dataset.name for dataset in ALL_DATASETS],
+        help="Restrict the run to one bronze feed. Defaults to all of them.",
     )
     parser.add_argument(
         "--skip-parquet",
@@ -120,22 +157,87 @@ def load() -> None:
 
     _configure_logging(args.quiet)
 
-    if not args.skip_parquet:
-        if args.source_file:
-            csv_paths = [settings.bronze_dir / args.source_file]
-        else:
-            csv_paths = sorted(settings.bronze_dir.glob("*.csv"))
+    selected = [d for d in ALL_DATASETS if args.dataset in (None, d.name)]
 
-        if not csv_paths:
-            print(f"No CSV landings found in {settings.bronze_dir}")
-            return
+    for dataset in selected:
+        if not args.skip_parquet:
+            if args.source_file:
+                candidate = dataset.landing_dir / args.source_file
+                csv_paths = [candidate] if candidate.exists() else []
+            else:
+                csv_paths = sorted(dataset.landing_dir.glob("*.csv"))
 
-        for csv_path in csv_paths:
-            write_bronze_parquet(csv_path)
-            print(f"Converted {csv_path.name}")
+            if not csv_paths:
+                print(f"No {dataset.name} CSV landings found in {dataset.landing_dir}")
+                # Skipping the load too: with nothing converted there is
+                # nothing new to insert, and running it anyway would
+                # rescan the whole Parquet dataset to insert zero rows.
+                continue
 
-    inserted = load_bronze_to_postgres(source_file=args.source_file)
-    print(f"Loaded {inserted} new rows into bronze.raw_gp")
+            for csv_path in csv_paths:
+                write_bronze_parquet(csv_path, dataset)
+                print(f"Converted {csv_path.name}")
+
+        inserted = load_bronze_to_postgres(source_file=args.source_file, dataset=dataset)
+        print(f"Loaded {inserted} new rows into {dataset.table}")
+
+
+def propagate() -> None:
+    """Propagate every current element set and replace gold.position_snapshot."""
+    parser = argparse.ArgumentParser(
+        description="Propagate current element sets with SGP4 and write the "
+        "resulting positions to gold.position_snapshot."
+    )
+    parser.add_argument(
+        "--at",
+        help="ISO 8601 instant to propagate to, e.g. '2026-08-16T12:00:00+00:00'. "
+        "Defaults to now. A value with no UTC offset is read as UTC.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="Propagate only this many satellites, lowest NORAD ID first. For "
+        "quick manual checks; a limited run still replaces the whole snapshot.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Compute and summarise the positions without writing them, leaving "
+        "the stored snapshot untouched.",
+    )
+    _add_verbosity_flag(parser)
+    args = parser.parse_args()
+
+    _configure_logging(args.quiet)
+
+    if args.at:
+        when = datetime.fromisoformat(args.at)
+        if when.tzinfo is None:
+            # The library refuses naive datetimes on purpose. The CLI is the
+            # boundary that may assume, so it does — out loud.
+            print(f"No UTC offset in --at; reading {args.at} as UTC.")
+            when = when.replace(tzinfo=UTC)
+    else:
+        when = datetime.now(UTC)
+
+    elsets = elements.load_propagatable_elsets(limit=args.limit)
+    if not elsets:
+        print("No propagatable element sets found. Has `sat-tracker-transform` run?")
+        return
+
+    positions = elements.propagate(elsets, when)
+    declined = len(elsets) - len(positions)
+
+    print(f"Propagated {len(positions)} satellites to {when.isoformat()}")
+    if declined:
+        print(f"SGP4 declined {declined}; they are omitted from the snapshot.")
+
+    if args.dry_run:
+        print("Dry run: gold.position_snapshot left unchanged.")
+        return
+
+    written = write_position_snapshot(positions)
+    print(f"Wrote {written} rows to gold.position_snapshot")
 
 
 def transform() -> None:

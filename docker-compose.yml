@@ -1,6 +1,16 @@
 services:
   postgres:
-    image: postgres:17-alpine
+    # PostGIS rather than plain postgres: gold.position_snapshot stores a
+    # geography(Point, 4326) column, and the extension has to ship with
+    # the image — CREATE EXTENSION cannot install what is not on disk.
+    #
+    # imresamu/ rather than the official postgis/postgis: that repo
+    # publishes amd64 only, for both its Debian and alpine variants, so it
+    # cannot run on an arm64 machine at all. imresamu is the multi-arch
+    # build from one of the same maintainers, tracking the same versions.
+    # An amd64 CI runner could substitute postgis/postgis:17-3.5-alpine
+    # with no other change.
+    image: imresamu/postgis:17-3.5-alpine
     container_name: sat_tracker_postgres
     environment:
       POSTGRES_USER: sat_tracker

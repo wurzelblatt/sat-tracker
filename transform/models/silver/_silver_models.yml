@@ -1,6 +1,40 @@
 version: 2
 
 models:
+  - name: space_object
+    description: >
+      Deduplicated current state of the CelesTrak satellite catalogue,
+      one row per norad_cat_id. Cleaning only — the newest landing wins,
+      because CelesTrak revises an object's row in place rather than
+      publishing a new dated record. Business flags live in
+      gold.dim_object.
+    data_tests:
+      # CelesTrak reports decay two ways: an ops_status_code of 'D' and a
+      # populated decay_date. They agree across all ~70,000 rows today,
+      # and gold.is_decayed trusts decay_date alone — so a disagreement
+      # would silently change which objects get propagated.
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "(ops_status_code = 'D') = (decay_date is not null)"
+    columns:
+      - name: norad_cat_id
+        description: >
+          NORAD catalog number, the grain of this table. Six digits since
+          July 2026.
+        data_tests:
+          - unique
+          - not_null
+
+      - name: object_type
+        description: PAY (payload), R/B (rocket body), DEB (debris) or UNK.
+        data_tests:
+          - not_null
+
+      - name: ingest_ts
+        description: When the landing behind this version of the row was fetched.
+        data_tests:
+          - not_null
+
   - name: elset
     description: >
       Deduplicated, SCD-2 historised orbital element sets, one row per

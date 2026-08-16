@@ -65,11 +65,8 @@ def loaded_parquet(
     sample_ingested_at: str,
 ) -> str:
     """Build a throwaway Parquet dataset and guarantee warehouse cleanup."""
-    from sat_tracker.storage import parquet_writer, postgres_loader
-
     parquet_root = str(tmp_path / "parquet")
-    monkeypatch.setattr(parquet_writer.settings, "parquet_root", parquet_root)
-    monkeypatch.setattr(postgres_loader.settings, "parquet_root", parquet_root)
+    monkeypatch.setattr(settings, "parquet_root", parquet_root)
 
     csv_path = tmp_path / TEST_SOURCE_FILE
     csv_path.write_text(sample_csv_payload)

@@ -18,6 +18,7 @@ from sat_tracker.ingest.celestrak_client import (
     fetch_omm_csv_group,
     fetch_omm_sds,
     fetch_omm_sds_group,
+    fetch_satcat,
     ingest,
     read_omm_sds,
 )
@@ -399,3 +400,95 @@ def test_ingest_requires_exactly_one_target(kwargs: dict) -> None:
     """`ingest` must reject an ambiguous or empty target."""
     with pytest.raises(ValueError, match="exactly one"):
         ingest(**kwargs)
+
+
+SATCAT_CSV_RESPONSE = (
+    "OBJECT_NAME,OBJECT_ID,NORAD_CAT_ID,OBJECT_TYPE,OPS_STATUS_CODE,OWNER,"
+    "LAUNCH_DATE,LAUNCH_SITE,DECAY_DATE,PERIOD,INCLINATION,APOGEE,PERIGEE,"
+    "RCS,DATA_STATUS_CODE,ORBIT_CENTER,ORBIT_TYPE\r\n"
+    "ISS (ZARYA),1998-067A,25544,PAY,+,ISS,1998-11-20,TTMTR,,92.9,51.64,"
+    "422,415,399.05,,EA,ORB\r\n"
+    "SL-1 R/B,1998-067B,25545,R/B,D,CIS,1998-11-20,TTMTR,1998-12-03,,,,,,,EA,ORB\r\n"
+)
+"""A two-row SATCAT sample: one payload in orbit, one decayed rocket body.
+
+The decayed row is the point — it carries a DECAY_DATE and empty
+PERIOD/INCLINATION/APOGEE/PERIGEE, which is exactly the shape that makes
+every bronze SATCAT column TEXT rather than typed.
+"""
+
+
+def test_fetch_satcat_writes_its_own_landing_zone(
+    isolated_settings, mock_celestrak_response
+) -> None:
+    """SATCAT must land under `satcat_dir`, separate from the GP landings.
+
+    A bulk load tells the two feeds apart by directory, so a SATCAT file
+    landing in `bronze_dir` would be converted with the GP schema.
+    """
+    mock_celestrak_response(text=SATCAT_CSV_RESPONSE)
+
+    path = fetch_satcat()
+
+    _assert_landing_filename(path, isolated_settings.satcat_dir, "satcat", ".csv")
+    # Compared as bytes: bronze's contract is byte-for-byte fidelity, and
+    # `read_text` would silently normalise CelesTrak's CRLF line endings.
+    assert path.read_bytes() == SATCAT_CSV_RESPONSE.encode("utf-8")
+    assert not isolated_settings.bronze_dir.exists()
+
+
+def test_fetch_satcat_queries_the_satcat_url(
+    isolated_settings, mock_celestrak_response
+) -> None:
+    """The dump is a static file on a different URL, requested with no query params."""
+    mock_get = mock_celestrak_response(text=SATCAT_CSV_RESPONSE)
+
+    fetch_satcat()
+
+    mock_get.assert_called_once()
+    assert mock_get.call_args.args[0] == isolated_settings.celestrak_satcat_url
+    assert mock_get.call_args.kwargs["params"] == {}
+
+
+def test_fetch_satcat_cache_outlives_the_gp_window(
+    isolated_settings, mock_celestrak_response
+) -> None:
+    """A 3-hour-old SATCAT landing is still fresh, where a GP one would not be.
+
+    This is the whole point of the separate TTL: CelesTrak rebuilds the
+    dump about once a day, so re-requesting it on the GP feed's 2-hour
+    cycle would spend 6.7 MB of the daily budget on identical bytes.
+    """
+    mock_get = mock_celestrak_response(text=SATCAT_CSV_RESPONSE)
+    path = fetch_satcat()
+    _make_stale(path, hours=3)
+
+    assert fetch_satcat() == path
+    mock_get.assert_called_once()
+
+
+def test_fetch_satcat_refetches_past_its_own_ttl(
+    isolated_settings, mock_celestrak_response
+) -> None:
+    """Once the 24-hour window lapses, a new request is made."""
+    mock_celestrak_response(text=SATCAT_CSV_RESPONSE)
+    first = fetch_satcat()
+    _make_stale(first, hours=25)
+
+    mock_get = mock_celestrak_response(text=SATCAT_CSV_RESPONSE)
+    second = fetch_satcat()
+
+    mock_get.assert_called_once()
+    assert second != first
+
+
+def test_fetch_satcat_is_tallied_against_the_daily_budget(
+    isolated_settings, mock_celestrak_response
+) -> None:
+    """The SATCAT dump is ~6.7 MB, so it must count against the same ledger."""
+    mock_celestrak_response(text=SATCAT_CSV_RESPONSE)
+
+    fetch_satcat()
+
+    ledger = json.loads((isolated_settings.state_dir / "download_volume.json").read_text())
+    assert ledger["bytes"] == len(SATCAT_CSV_RESPONSE.encode("utf-8"))
