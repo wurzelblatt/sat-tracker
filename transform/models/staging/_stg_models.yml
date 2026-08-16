@@ -1,6 +1,26 @@
 version: 2
 
 models:
+  - name: stg_celestrak_satcat
+    description: >
+      Bronze SATCAT landings with real types. One row per catalogued
+      object per ingestion, so this still contains duplicates across
+      fetches — collapsing to one row per object happens in
+      gold.dim_object.
+    columns:
+      - name: norad_cat_id
+        description: NORAD catalog number, as an integer.
+        data_tests:
+          - not_null
+      - name: object_type
+        description: PAY, R/B, DEB or UNK.
+        data_tests:
+          - not_null
+      - name: ingest_ts
+        description: When this row was fetched from CelesTrak.
+        data_tests:
+          - not_null
+
   - name: stg_celestrak_gp
     description: >
       Bronze GP landings with real types. One row per satellite per

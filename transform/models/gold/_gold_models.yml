@@ -1,0 +1,92 @@
+version: 2
+
+models:
+  - name: dim_object
+    description: >
+      One row per catalogued space object, from CelesTrak's full SATCAT
+      by way of silver.space_object. Includes decayed objects on purpose:
+      a fact row must still resolve its satellite after that satellite
+      has re-entered. Adds the derived flags that turn catalogue
+      attributes into propagation and display decisions.
+    columns:
+      - name: norad_cat_id
+        description: >
+          NORAD catalog number, the grain of this table and the key every
+          fact joins on. Six digits since July 2026.
+        data_tests:
+          # Guaranteed upstream by the dedup in silver.space_object, but
+          # re-asserted here: this is the key every fact will join on, so
+          # it is worth proving at the point of use.
+          - unique
+          - not_null
+
+      - name: object_type
+        description: >
+          PAY (payload), R/B (rocket body), DEB (debris) or UNK.
+        data_tests:
+          - not_null
+          # These are the four values CelesTrak's own format page
+          # documents, and the only four present across all 70,270 rows.
+          # Note they deliberately differ from the literals sketched in
+          # .claude/data-model.md, which do not match the live feed.
+          - accepted_values:
+              arguments:
+                values: ["PAY", "R/B", "DEB", "UNK"]
+
+      - name: orbit_regime
+        description: >
+          LEO (<2,000 km apogee), MEO (<35,000 km), GEO/HEO, or unknown
+          when SATCAT publishes no apogee. Derived from SATCAT's own
+          apogee so it is available even for objects with no elements.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ["LEO", "MEO", "GEO/HEO", "unknown"]
+
+      - name: is_decayed
+        description: >
+          True when the object has re-entered. The hard exclusion gate
+          for propagation: a decayed object has no position to plot.
+        data_tests:
+          - not_null
+
+      - name: is_earth_orbiting
+        description: >
+          True for objects orbiting Earth, or docked to a host that is.
+          False for the 431 heliocentric, lunar, planetary and Lagrange
+          objects, which fall outside SGP4's domain entirely.
+        data_tests:
+          - not_null
+
+      - name: launch_date
+        description: Launch date. The catalogue starts at 1957-10-04, Sputnik 1.
+
+      - name: decay_date
+        description: >
+          Re-entry date, or NULL when the object is still in orbit. NULL
+          means "in orbit", not "unknown" — the ingest reads empty CSV
+          fields as NULL.
+
+      - name: apogee_km
+        description: >
+          Apogee altitude in km, up to 4,082,876 for lunar and highly
+          eccentric orbits. NULL when SATCAT publishes no orbit.
+
+      - name: perigee_km
+        description: Perigee altitude in km.
+
+      - name: period_minutes
+        description: >
+          Orbital period in minutes, up to ~486,100 (about 337 days).
+          Above ~225 minutes SGP4 switches to its deep-space branch.
+
+      - name: orbit_center
+        description: >
+          Body the object orbits. 'EA' is Earth; a numeric value is the
+          NORAD ID of a host satellite the object is docked to.
+
+      - name: ingest_ts
+        description: When the SATCAT landing behind this row was fetched.
+        data_tests:
+          - not_null

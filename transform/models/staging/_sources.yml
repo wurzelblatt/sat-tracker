@@ -3,13 +3,41 @@ version: 2
 sources:
   - name: bronze
     description: >
-      Raw CelesTrak GP/OMM landings, loaded from the partitioned Parquet
-      dataset. Every payload column is TEXT by design: bronze's contract
-      is fidelity, so a value CelesTrak sends that does not parse must
-      land intact and fail loudly in a silver test rather than be
-      coerced here.
+      Raw CelesTrak landings — GP/OMM element sets and the SATCAT object
+      catalogue — loaded from their partitioned Parquet datasets. Every
+      payload column is TEXT by design: bronze's contract is fidelity, so
+      a value CelesTrak sends that does not parse must land intact and
+      fail loudly in a downstream test rather than be coerced here.
     schema: bronze
     tables:
+      - name: raw_satcat
+        description: >
+          One row per catalogued object per ingestion, from CelesTrak's
+          full SATCAT dump. Deliberately the whole catalogue including
+          decayed objects, not a filter of currently-active ones: a
+          dimension must still resolve a satellite that re-entered after
+          its last element set was published.
+        loaded_at_field: ingest_ts
+        freshness:
+          # CelesTrak rebuilds the SATCAT file about once a day (confirmed
+          # from its Last-Modified header), and the client caches for 24h,
+          # so a landing older than a day means a cycle was missed.
+          warn_after: {count: 24, period: hour}
+          error_after: {count: 48, period: hour}
+        columns:
+          - name: norad_cat_id
+            description: NORAD catalog number. Six digits since July 2026.
+            data_tests:
+              - not_null
+          - name: object_type
+            description: PAY, R/B, DEB or UNK. Tested for value drift in gold.
+            data_tests:
+              - not_null
+          - name: source_file
+            description: Landing file the row came from; part of the bronze PK.
+            data_tests:
+              - not_null
+
       - name: raw_gp
         description: One row per satellite per ingestion.
         loaded_at_field: ingest_ts

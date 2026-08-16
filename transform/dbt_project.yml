@@ -31,3 +31,13 @@ models:
       # correctness first, optimise if measured.
       +materialized: table
       +schema: silver
+    gold:
+      # Table, not view: dim_object deduplicates the full 70,270-object
+      # catalogue with a row_number() window, and every fact joining
+      # against a view would re-run that scan. Serving models are read
+      # far more often than they are rebuilt, so the cost belongs at
+      # build time. Rebuilt in full for the same reason silver is —
+      # a later SATCAT landing changes which row wins per object, not
+      # just which rows exist.
+      +materialized: table
+      +schema: gold
