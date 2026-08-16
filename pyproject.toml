@@ -25,6 +25,7 @@ sat-tracker-ingest = "sat_tracker.cli:main"
 sat-tracker-satcat = "sat_tracker.cli:satcat"
 sat-tracker-load = "sat_tracker.cli:load"
 sat-tracker-transform = "sat_tracker.cli:transform"
+sat-tracker-propagate = "sat_tracker.cli:propagate"
 
 [build-system]
 requires = ["uv_build>=0.11.8,<0.12.0"]

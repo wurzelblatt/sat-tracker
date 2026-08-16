@@ -43,6 +43,5 @@ transform/.user.yml
 
 # Working notes, not part of the shipped project
 plans/
-reports/
 docs/commit-messages/
 docs/dumpfiles_for_ref
