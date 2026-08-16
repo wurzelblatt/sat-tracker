@@ -15,6 +15,7 @@ dependencies = [
     "pydantic>=2.13.4",
     "pydantic-settings>=2.14.2",
     "requests>=2.34.2",
+    "sgp4>=2.27",
     "spacedatastandards-org>=23.3.3.0.3.7",
 ]
 
