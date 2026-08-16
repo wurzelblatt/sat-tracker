@@ -1,6 +1,53 @@
 version: 2
 
 models:
+  - name: fact_propagatable_elset
+    description: >
+      One row per satellite that can actually be propagated right now:
+      the current element set, filtered to objects that have not decayed
+      and that orbit Earth. This is the serving contract the propagation
+      step reads, so its guarantees are asserted here at the boundary
+      rather than relied on from upstream.
+    columns:
+      - name: norad_cat_id
+        description: >
+          NORAD catalog number. The grain of this view, and the join key
+          back to dim_object for object attributes.
+        data_tests:
+          # Duplicates Step 2's assert_one_current_elset_per_satellite,
+          # which proves the same invariant one layer down. Worth the
+          # second query: this one also catches a regression introduced
+          # by the join in this model, which the upstream test cannot see.
+          - unique
+          - not_null
+          # Hard error rather than warn. GP and SATCAT are fetched
+          # independently and can drift, but taking the FULL SATCAT dump
+          # rather than GROUP=active makes an unresolvable key
+          # structurally impossible — all 16,352 satellites in silver
+          # resolve against all 70,270 catalogued objects.
+          - relationships:
+              arguments:
+                to: ref('dim_object')
+                field: norad_cat_id
+
+      - name: epoch
+        description: >
+          UTC instant the element set describes. SGP4 propagates forward
+          or backward from here, and accuracy degrades roughly 1-3 km per
+          day of separation from it.
+        data_tests:
+          - not_null
+
+      - name: mean_motion
+        description: Revolutions per day. Required by SGP4 to initialise.
+        data_tests:
+          - not_null
+
+      - name: eccentricity
+        description: Orbital eccentricity, bounded [0, 1). Required by SGP4.
+        data_tests:
+          - not_null
+
   - name: dim_object
     description: >
       One row per catalogued space object, from CelesTrak's full SATCAT
