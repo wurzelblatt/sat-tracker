@@ -9,7 +9,7 @@ things are right now.
 
 > **Status:** capstone project in progress. The pipeline is complete end to
 > end — ingestion, bronze, silver, gold and SGP4 propagation — with 120
-> Python tests and 54 dbt tests. A Streamlit map and Airflow orchestration
+> Python tests and 48 dbt tests. A Streamlit map and Airflow orchestration
 > are what remain. See [`docs/architecture.md`](docs/architecture.md) for
 > design rationale and [`docs/runbook.md`](docs/runbook.md) for day-to-day
 > operation.

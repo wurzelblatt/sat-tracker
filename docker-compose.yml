@@ -28,5 +28,48 @@ services:
       timeout: 5s
       retries: 10
 
+  # Browser SQL client at http://localhost:5050. Optional — nothing in the
+  # pipeline depends on it, and `docker compose up -d postgres` starts the
+  # warehouse alone.
+  #
+  # pgAdmin rather than a lighter client (Adminer, pgweb) for one reason:
+  # its Query Tool has a Geometry Viewer that renders geometry columns on a
+  # map. Selecting `geo_point::geometry` from gold.position_snapshot plots
+  # the satellites directly from SQL. Cast to geometry explicitly — the
+  # viewer keys off that type and does not always trigger on geography.
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: sat_tracker_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+      # Desktop mode: skips the login screen. Safe here because this is a
+      # local-only dev container with no data of its own.
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    ports:
+      - "5050:80"
+    volumes:
+      # Persists registered servers and query history across restarts, so
+      # the connection below only has to be set up once.
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+# Connect pgAdmin to the warehouse with:
+# General tab:
+#   Name      SAT_TRACKER (can be anything)
+# Connection tab:
+#   Host      postgres        <- the SERVICE NAME, not localhost
+#   Port      5432            <- the CONTAINER port, not the published 5433
+#   Database  sat_tracker
+#   Username  sat_tracker
+#   Password  sat_tracker
+#
+# The 5433 mapping exists for connections from the host machine. Inside the
+# compose network the containers reach each other by service name, and
+# `localhost` from pgAdmin would point at pgAdmin itself.
+
 volumes:
   postgres_data:
+  pgadmin_data:

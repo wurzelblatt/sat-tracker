@@ -24,7 +24,7 @@ wrong, and the data said so before the code was written.
 | Gold | `dim_object`, `fact_propagatable_elset`, `position_snapshot` |
 | Propagation | `frames` (TEME→WGS84), `elements` (SGP4 driver) |
 | Infrastructure | PostGIS, generated `geography` column, GIST index |
-| Tests | 62 → 120 Python, 24 → 54 dbt |
+| Tests | 62 → 120 Python, 22 → 48 dbt |
 
 End state, all reproducible from the CSV landing zone:
 

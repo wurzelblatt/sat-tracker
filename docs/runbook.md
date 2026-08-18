@@ -163,9 +163,10 @@ uv run sat-tracker-transform --select stg_celestrak_satcat+
 uv run sat-tracker-transform --command test
 ```
 
-A full build runs 6 models and 54 tests in about 4 seconds. Expect
-`PASS=54 WARN=0 ERROR=0`; anything else means a model produced data its own
-tests reject.
+A full build runs 6 models and 48 data tests in about 4 seconds. Expect
+`PASS=54 WARN=0 ERROR=0` — that 54 counts *nodes*, models and tests
+together, which is why it exceeds the test count. Anything other than a
+clean pass means a model produced data its own tests reject.
 
 `build` (the default) runs each model **and its tests together**, so a
 model that produces bad data fails immediately rather than being tested

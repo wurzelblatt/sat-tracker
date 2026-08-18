@@ -3,10 +3,7 @@
 ## Overview
 
 `sat-tracker` ingests two CelesTrak feeds — orbital element sets (OMM/GP)
-and the object catalogue (SATCAT) — lands both in a local **bronze** layer
-byte-for-byte alongside structured audit metadata, and stores them in
-partitioned Parquet datasets loaded idempotently into Postgres. dbt builds
-a **silver** layer (deduplicated, SCD-2 historised element sets, plus
+and the object catalogue (SATCAT) — lands both in a local **bronze** layer byte-for-byte alongside structured audit metadata, and stores them in partitioned Parquet datasets loaded idempotently into Postgres. dbt builds a **silver** layer (deduplicated, SCD-2 historised element sets, plus
 current object state) and a **gold** layer of serving models. SGP4 then
 propagates the current element sets into `gold.position_snapshot`, a
 PostGIS table recording where every tracked object is at a given instant.
@@ -15,6 +12,7 @@ The medallion architecture is complete end to end. What remains is
 orchestration and presentation, not pipeline.
 
 ```
+
 CelesTrak GP endpoint                    CelesTrak SATCAT dump
   gp.php?GROUP=|CATNR=                     /pub/satcat.csv
         │                                        │
@@ -24,32 +22,40 @@ CelesTrak GP endpoint                    CelesTrak SATCAT dump
    ├─ identifying User-Agent
    ├─ daily volume budget (halt before the request)
    ├─ cache check (2h for GP, 24h for SATCAT)
-   ├─ conditional request (ETag → If-None-Match → 304 reuses cache)
+   ├─ conditional ETag request (Hash → If-None-Match → Response:304 NotModified → reuses cache)
    └─ fail-fast status gate (only 200/304; never retry anything else)
                         │
         ┌───────────────┼───────────────┐
         ▼               ▼               ▼
-   data/bronze/    data/sds/    data/bronze_satcat/   ← raw, byte-for-byte
-     *.csv          *.sds            *.csv             + .meta.json sidecars
-        │                               │
-        ▼  write_bronze_parquet(dataset=GP | SATCAT)
-   bronze_parquet/            bronze_satcat_parquet/  ← ingest_date=/hour=
-        │                               │
-        ▼  load_bronze_to_postgres(dataset=...)
-   bronze.raw_gp                 bronze.raw_satcat    ← idempotent load
-        │                               │
-        ▼  dbt: stg_celestrak_gp        ▼  dbt: stg_celestrak_satcat
-        ▼  dbt: silver.elset            ▼  dbt: silver.space_object
-        │       (dedup + SCD-2)         │       (dedup to current)
-        └───────────────┬───────────────┘
-                        ▼  dbt: gold
-        gold.dim_object  ◀── gold.fact_propagatable_elset
-                        │
-                        ▼  sat-tracker-propagate (SGP4 + TEME→WGS84)
-              gold.position_snapshot                  ← PostGIS, GIST indexed
+   data/bronze/    data/sds/    data/bronze_satcat/   ← raw, byte-for-byte      ⎫
+     *.csv          *.sds            *.csv             + .meta.json sidecars    ⎪
+        │                               │                                       ⎪
+        ▼                               ▼                                       ⎪ Bronze
+   bronze_parquet/            bronze_satcat_parquet/  ← ingest_date=/hour=      ⎪
+        │                               │                                       ⎪
+        ▼                               ▼                                       ⎪
+   bronze.raw_gp                 bronze.raw_satcat    ← idempotent load     ⎫   ⎭
+        │                               │               to Postgres         ⎪
+        ▼                               ▼                     ⎫             ⎪            
+dbt: stg_celestrak_gp          dbt: stg_celestrak_satcat      ⎪ Staging     ⎪
+        │                               │                     ⎭             ⎪
+        ▼                               ▼                     ⎫             ⎪
+dbt: silver.elset               dbt: silver.space_object      ⎪ Silver      ⎪ Postgres
+(dedup + SCD-2)                   (dedup to current)          ⎭             ⎪
+        │                               │                                   ⎪
+        └───────────────┬───────────────┘                                   ⎪
+                        ▼  dbt: gold                                        ⎪   ⎫
+        gold.dim_object  ◀── gold.fact_propagatable_elset                   ⎪   ⎪
+                        │                                                   ⎪   ⎪ Gold
+                        ▼  sat-tracker-propagate (SGP4 + TEME→WGS84)        ⎪   ⎪
+              gold.position_snapshot         ← PostGIS, GIST indexed        ⎭   ⎭ 
 ```
 
+
+
 ## Components
+
+
 
 ### `sat_tracker.config.Settings`
 
@@ -58,19 +64,21 @@ module-level singleton `settings`. This is the **only** place
 environment-specific values (URLs, paths, format defaults) may live —
 client code must never hardcode them.
 
-| Field           | Default                                        | Purpose                                   |
-|-----------------|-------------------------------------------------|--------------------------------------------|
-| `app_name`      | `"sat-tracker"`                                 | Logging/diagnostics label                  |
-| `debug`         | `False`                                         | Reserved for verbose/less-strict behavior  |
-| `celestrak_url` | `https://celestrak.org/NORAD/elements/gp.php`   | CelesTrak GP endpoint base URL             |
-| `celestrak_satcat_url` | `https://celestrak.org/pub/satcat.csv`   | Full SATCAT dump (static file, not a query) |
-| `satcat_cache_ttl_hours` | `24`                                  | SATCAT cache window; the file is rebuilt daily |
-| `ingest_format` | `"csv"`                                         | Default format for `ingest()`: `csv`/`sds` |
-| `bronze_dir`    | `data/bronze`                                   | GP CSV landing zone                        |
-| `satcat_dir`    | `data/bronze_satcat`                            | SATCAT CSV landing zone                    |
-| `sds_dir`       | `data/sds`                                      | SDS FlatBuffer landing zone                |
-| `parquet_root`  | `data/bronze_parquet`                           | GP Parquet dataset root                    |
-| `satcat_parquet_root` | `data/bronze_satcat_parquet`              | SATCAT Parquet dataset root                |
+
+| Field                    | Default                                       | Purpose                                        |
+| ------------------------ | --------------------------------------------- | ---------------------------------------------- |
+| `app_name`               | `"sat-tracker"`                               | Logging/diagnostics label                      |
+| `debug`                  | `False`                                       | Reserved for verbose/less-strict behavior      |
+| `celestrak_url`          | `https://celestrak.org/NORAD/elements/gp.php` | CelesTrak GP endpoint base URL                 |
+| `celestrak_satcat_url`   | `https://celestrak.org/pub/satcat.csv`        | Full SATCAT dump (static file, not a query)    |
+| `satcat_cache_ttl_hours` | `24`                                          | SATCAT cache window; the file is rebuilt daily |
+| `ingest_format`          | `"csv"`                                       | Default format for `ingest()`: `csv`/`sds`     |
+| `bronze_dir`             | `data/bronze`                                 | GP CSV landing zone                            |
+| `satcat_dir`             | `data/bronze_satcat`                          | SATCAT CSV landing zone                        |
+| `sds_dir`                | `data/sds`                                    | SDS FlatBuffer landing zone                    |
+| `parquet_root`           | `data/bronze_parquet`                         | GP Parquet dataset root                        |
+| `satcat_parquet_root`    | `data/bronze_satcat_parquet`                  | SATCAT Parquet dataset root                    |
+
 
 The two feeds have **separate landing directories on purpose**. Landing
 filenames carry only a stem and an ingestion ID, nothing about schema, so a
@@ -88,16 +96,16 @@ The CelesTrak ingestion client. Two parallel flows — CSV and SDS — share
 the same cache-check, HTTP-fetch, and file-write logic:
 
 - `fetch_omm_csv(norad_id)` / `fetch_omm_csv_group(group)` — write the
-  raw OMM-CSV response verbatim to `bronze_dir`.
+raw OMM-CSV response verbatim to `bronze_dir`.
 - `fetch_omm_sds(norad_id)` / `fetch_omm_sds_group(group)` — parse the
-  JSON response and encode it as a binary `OMM` FlatBuffer (via
-  `spacedatastandards-org`) written to `sds_dir`.
+JSON response and encode it as a binary `OMM` FlatBuffer (via
+`spacedatastandards-org`) written to `sds_dir`.
 - `ingest(norad_id)` — dispatches to the CSV or SDS flow based on
-  `settings.ingest_format`.
+`settings.ingest_format`.
 - `fetch_satcat()` — downloads CelesTrak's full SATCAT dump (~70,000
-  objects, 6.7 MB) into `satcat_dir`.
+objects, 6.7 MB) into `satcat_dir`.
 
-**Why the full SATCAT dump rather than `GROUP=active`.** `gold.dim_object`
+**Why the full SATCAT dump rather than** `GROUP=active`**.** `gold.dim_object`
 is a dimension, and a dimension filtered to whatever the fact currently
 contains stops being one: an object that decays *after* its last element
 set was published leaves the fact with a key pointing at nothing. That is
@@ -125,27 +133,31 @@ CelesTrak is a free public service; the pipeline is designed to be a
 good citizen of it and to avoid getting the developer's IP banned:
 
 1. **Local cache verification** (`_is_cache_fresh`): before any HTTP
-   request, the landing zone is checked for an existing file for the
+  request, the landing zone is checked for an existing file for the
    same target (NORAD ID or group) less than 2 hours old
    (`_CACHE_TTL`). If found, it's returned directly and no request is
    made — logged as `"Using cached local data (under 2 hours old)"`.
 2. **Fail-fast error gates** (`_get_celestrak`): `Retry(total=0)` is
-   configured explicitly — any HTTP response other than `200` (redirects,
+  configured explicitly — any HTTP response other than `200` (redirects,
    `403`, `404`, `5xx`, ...) raises `CelesTrakFatalError` immediately.
    There is no automatic retry, because retrying against a blocking or
    rate-limiting response is what gets IPs banned.
+
+
 
 ### Auditability
 
 Every write goes through `_write_with_metadata`, which:
 
 - Names the file `<stem>_<ingested_at:%Y%m%dT%H%M%S%fZ>_<ingestion_id><suffix>`
-  so repeated ingestions of the same target never collide or overwrite
-  each other.
+so repeated ingestions of the same target never collide or overwrite
+each other.
 - Writes a `<filename>.meta.json` sidecar containing the UTC
-  `ingested_at` timestamp and a UUID `ingestion_id`, without mutating
-  the raw payload itself — the bronze file stays byte-for-byte what
-  CelesTrak returned.
+`ingested_at` timestamp and a UUID `ingestion_id`, without mutating
+the raw payload itself — the bronze file stays byte-for-byte what
+CelesTrak returned.
+
+
 
 ### CLI
 
@@ -153,13 +165,15 @@ Thin `argparse` wrappers in `src/sat_tracker/cli.py`, one command per
 pipeline stage. Verbose (`INFO`-level) logging is the default; `--quiet`
 drops it to `WARNING`.
 
-| Command | Stage |
-|---|---|
-| `sat-tracker-ingest` | Fetch GP/OMM element sets into bronze |
-| `sat-tracker-satcat` | Fetch the SATCAT catalogue into bronze |
-| `sat-tracker-load` | CSV → Parquet → Postgres, dispatching per dataset |
-| `sat-tracker-transform` | Run dbt: staging, silver, gold, and all tests |
-| `sat-tracker-propagate` | SGP4 + TEME→WGS84 → `gold.position_snapshot` |
+
+| Command                 | Stage                                             |
+| ----------------------- | ------------------------------------------------- |
+| `sat-tracker-ingest`    | Fetch GP/OMM element sets into bronze             |
+| `sat-tracker-satcat`    | Fetch the SATCAT catalogue into bronze            |
+| `sat-tracker-load`      | CSV → Parquet → Postgres, dispatching per dataset |
+| `sat-tracker-transform` | Run dbt: staging, silver, gold, and all tests     |
+| `sat-tracker-propagate` | SGP4 + TEME→WGS84 → `gold.position_snapshot`      |
+
 
 Keeping the stages separate is deliberate: an orchestrator should call
 commands that already work standalone, so a scheduling problem can never
@@ -175,6 +189,8 @@ and `--dry-run`. The library refuses timezone-naive datetimes; the CLI is
 the boundary that may assume UTC, and does so out loud.
 
 ## Storage layer
+
+
 
 ### `sat_tracker.storage.datasets`
 
@@ -279,13 +295,15 @@ schemas within it: `bronze`, `silver`, `gold`.
 `sql/init/*.sql` runs **once, on first initialisation of an empty volume**,
 in filename order:
 
-| Script | Creates |
-|---|---|
-| `00_extensions.sql` | `CREATE EXTENSION postgis` |
-| `01_schemas.sql` | `bronze`, `silver`, `gold` |
-| `02_bronze_raw_gp.sql` | GP landing table |
-| `03_bronze_raw_satcat.sql` | SATCAT landing table |
+
+| Script                          | Creates                       |
+| ------------------------------- | ----------------------------- |
+| `00_extensions.sql`             | `CREATE EXTENSION postgis`    |
+| `01_schemas.sql`                | `bronze`, `silver`, `gold`    |
+| `02_bronze_raw_gp.sql`          | GP landing table              |
+| `03_bronze_raw_satcat.sql`      | SATCAT landing table          |
 | `04_gold_position_snapshot.sql` | Propagated positions, PostGIS |
+
 
 The `00` prefix is load-bearing: `04` declares a `geography(Point, 4326)`
 column that cannot resolve unless the extension already exists. Running
@@ -293,8 +311,8 @@ these scripts against a plain `postgres` image fails there, which is the
 intended behaviour — a silently absent PostGIS would otherwise surface much
 later as an unrecognised type.
 
-**Image: `imresamu/postgis:17-3.5-alpine`, not the official
-`postgis/postgis`.** That repo publishes **amd64 only**, for both its
+**Image:** `imresamu/postgis:17-3.5-alpine`**, not the official**
+`postgis/postgis`**.** That repo publishes **amd64 only**, for both its
 Debian and its alpine variants, so it cannot run on an arm64 machine at
 all. `imresamu` is the multi-arch build from one of the same maintainers,
 tracking the same versions. An amd64 CI runner can substitute
@@ -308,6 +326,8 @@ Postgres is derived; see the runbook for the procedure.
 
 ## Silver layer (`transform/`, dbt)
 
+
+
 ### `stg_celestrak_gp` (view)
 
 Casts bronze's all-`TEXT` columns to real types. Casts are deliberately
@@ -319,7 +339,7 @@ elements, whereas a hard cast turns it into a red build.
 
 One row per `(norad_cat_id, epoch)`, deduplicated and SCD-2 historised.
 
-**Why no `dbt snapshot`.** Snapshots exist to reconstruct history that a
+**Why no** `dbt snapshot`**.** Snapshots exist to reconstruct history that a
 *mutable* source fails to record. This source is not mutable: CelesTrak
 never revises the element set for a given `(satellite, epoch)` — it
 publishes a *new* one with a *new* epoch. History is not lost and
@@ -339,7 +359,7 @@ Snapshotting would conflate the two, and a missed pipeline run would
 silently corrupt the intervals. The model is also fully rebuildable
 from bronze at any time and always converges to the same answer.
 
-**Why `table`, not `incremental`.** The `lead()` means a newly arriving
+**Why** `table`**, not** `incremental`**.** The `lead()` means a newly arriving
 epoch *mutates the previous row's* `valid_to` for that satellite. That
 is not an append, so incremental logic would have to reprocess each
 affected satellite's tail — a classic source of silent correctness
@@ -357,7 +377,7 @@ answer to "when did this enter our system?".
 One row per catalogued object, deduplicated to current state. Cleaning
 only — the derived business flags live in gold.
 
-**Latest wins, where `elset` keeps earliest.** The two models use the same
+**Latest wins, where** `elset` **keeps earliest.** The two models use the same
 `row_number()` window with the opposite `order by`, for opposite reasons.
 CelesTrak *revises* an object's SATCAT row in place — `ops_status_code`
 flips `+` to `D`, `decay_date` appears where it was NULL — so the newest
@@ -388,13 +408,15 @@ tests guard the SCD-2 logic specifically — the part most likely to
 break silently:
 
 - `assert_one_current_elset_per_satellite` — zero current rows means a
-  broken partition; more than one means duplicate epochs survived
-  deduplication.
+broken partition; more than one means duplicate epochs survived
+deduplication.
 - `assert_validity_intervals_are_contiguous` — each `valid_to` must
-  equal the next `valid_from`. If this breaks, an "orbit as of time T"
-  lookup either matches nothing or matches two element sets, and the
-  failure surfaces downstream as a wrong satellite position rather than
-  as a loud error.
+equal the next `valid_from`. If this breaks, an "orbit as of time T"
+lookup either matches nothing or matches two element sets, and the
+failure surfaces downstream as a wrong satellite position rather than
+as a loud error.
+
+
 
 ### Deviations from `data-model.md`
 
@@ -424,6 +446,8 @@ sends, rather than carrying four permanently-NULL columns.
 
 ## Gold layer
 
+
+
 ### `gold.dim_object` (table)
 
 One row per catalogued object — the descriptive dimension the map and the
@@ -434,11 +458,13 @@ ingest above.
 Three derived flags, each earned by something observed in the data rather
 than chosen up front:
 
-| Flag | What it excludes | Evidence |
-|---|---|---|
-| `is_decayed` | Objects that have re-entered | 8 Starlinks decayed between two GP fetches a week apart; 2 more between fetches two days apart |
-| `is_earth_orbiting` | 416 solar, lunar, planetary and Lagrange objects | SGP4 is defined only for Earth orbit |
-| `orbit_regime` | *(classifies rather than excludes)* | MEO satellites are ~40× likelier than LEO ones to carry an element set older than 48 h — 21% vs 0.5% |
+
+| Flag                | What it excludes                                 | Evidence                                                                                             |
+| ------------------- | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| `is_decayed`        | Objects that have re-entered                     | 8 Starlinks decayed between two GP fetches a week apart; 2 more between fetches two days apart       |
+| `is_earth_orbiting` | 416 solar, lunar, planetary and Lagrange objects | SGP4 is defined only for Earth orbit                                                                 |
+| `orbit_regime`      | *(classifies rather than excludes)*              | MEO satellites are ~40× likelier than LEO ones to carry an element set older than 48 h — 21% vs 0.5% |
+
 
 `is_earth_orbiting` has a subtlety worth knowing: three `orbit_center`
 values are **NORAD IDs rather than body codes** (e.g. `25544`, the ISS),
@@ -503,6 +529,8 @@ for highly eccentric orbits anchored at a predicted perigee passage. A
 
 ## Propagation (`sat_tracker.propagate`)
 
+
+
 ### `frames` — TEME to WGS84
 
 SGP4 does not return a position on the Earth. It returns a vector in TEME
@@ -514,15 +542,15 @@ TEME  --rotate by GMST-->  ECEF  --ellipsoid-->  lat / lon / alt
 ```
 
 - `gmst_radians` — the IAU 1982 polynomial, verified against
-  `sgp4.propagation.gstime` across a century and against the published
-  J2000 constant, 280.46061837°.
+`sgp4.propagation.gstime` across a century and against the published
+J2000 constant, 280.46061837°.
 - `teme_to_ecef` — a single Z-axis rotation. The *frame* rotates, not the
-  vector, so a reversed sign gives a longitude wrong by twice GMST that
-  still traces a plausible ground track.
+vector, so a reversed sign gives a longitude wrong by twice GMST that
+still traces a plausible ground track.
 - `ecef_to_geodetic` — Bowring's closed form. Geodetic latitude is measured
-  from the ellipsoid **normal**, not from the centre of the Earth; the
-  geocentric answer is the intuitive one and is wrong by up to 0.19°, about
-  21 km on the ground.
+from the ellipsoid **normal**, not from the centre of the Earth; the
+geocentric answer is the intuitive one and is wrong by up to 0.19°, about
+21 km on the ground.
 
 Altitude branches at 45° between `p/cos(lat)` and `z/sin(lat)`. Both are
 exact and singular at opposite ends — the first at the poles, the second at
@@ -555,11 +583,13 @@ a straight column mapping.
 
 **Measured performance**, for the full 16,342-satellite catalogue:
 
-| Stage | Time | Share |
-|---|---|---|
-| Building `Satrec` objects (Python loop) | 0.248 s | 62% |
-| `SatrecArray.sgp4` (vectorised C) | 0.007 s | 1.6% |
-| `teme_to_geodetic` (Python loop) | 0.148 s | 37% |
+
+| Stage                                   | Time    | Share |
+| --------------------------------------- | ------- | ----- |
+| Building `Satrec` objects (Python loop) | 0.248 s | 62%   |
+| `SatrecArray.sgp4` (vectorised C)       | 0.007 s | 1.6%  |
+| `teme_to_geodetic` (Python loop)        | 0.148 s | 37%   |
+
 
 The propagation itself is optimally vectorised and is the cheapest stage;
 the loops around it dominate. Left as is — 0.4 s for the catalogue is a
@@ -618,14 +648,15 @@ documented, valueless template) should ever be committed.
 `tests/conftest.py`:
 
 - `settings` — a fresh `Settings(_env_file=None)`, isolated from any
-  developer `.env`.
+developer `.env`.
 - `isolated_settings` — additionally redirects `bronze_dir`, `satcat_dir`,
-  `sds_dir` and `state_dir` to a pytest `tmp_path`, so tests never touch
-  the real landing zones or the volume ledger.
+`sds_dir` and `state_dir` to a pytest `tmp_path`, so tests never touch
+the real landing zones or the volume ledger.
 - `mock_celestrak_response` — patches `requests.Session.get`, supporting
-  `text=`, `json_body=`, and `status_code=` (default `200`).
+`text=`, `json_body=`, and `status_code=` (default `200`).
 
-**120 Python tests plus 54 dbt tests.** Coverage includes both formats
+**120 Python tests plus 48 dbt tests.** (A full `dbt build` reports
+`PASS=54`, which counts nodes — 48 tests plus 6 models.) Coverage includes both formats
 (single + group), the compliance shield (fresh/stale cache, fail-fast on
 multiple error statuses), the metadata sidecar's structure, the dataset
 descriptors, the coordinate transformation, propagation, and the snapshot
@@ -639,11 +670,11 @@ oracles**, because every bug it can have produces a plausible position
 somewhere real — "it looks about right" is not evidence:
 
 1. GMST against `sgp4.propagation.gstime`, a separate implementation of the
-   same polynomial that ships with a dependency the project already has.
+  same polynomial that ships with a dependency the project already has.
 2. Analytically exact fixed points — equator, poles, 90°E, a known altitude
-   — which are exact by construction rather than by reference data.
+  — which are exact by construction rather than by reference data.
 3. A round trip through the closed-form *forward* transform, implemented in
-   the test file as the reference, over points spanning LEO to
+  the test file as the reference, over points spanning LEO to
    geostationary.
 
 The round-trip tolerance is 1e-6 degrees, bounded by Bowring's drift at
@@ -660,29 +691,30 @@ conversion and no Python test can see inside it.
 ## Open follow-up work
 
 - **Streamlit map** over `gold.position_snapshot`, joined to `dim_object`
-  for names, object type and `orbit_regime`. `epoch_age_hours` interpreted
-  against regime — not against a flat threshold — is what expresses
-  confidence honestly.
+for names, object type and `orbit_regime`. `epoch_age_hours` interpreted
+against regime — not against a flat threshold — is what expresses
+confidence honestly.
 - **Airflow orchestration.** Deliberately last: every stage is already a
-  standalone CLI command, so the DAG is thin operators over commands that
-  work on their own. Note one coupling worth scheduling correctly —
-  refreshing GP without refreshing SATCAT leaves the decay gate stale, and
-  two satellites were caught by exactly that in testing.
+standalone CLI command, so the DAG is thin operators over commands that
+work on their own. Note one coupling worth scheduling correctly —
+refreshing GP without refreshing SATCAT leaves the decay gate stale, and
+two satellites were caught by exactly that in testing.
 - **S3 flip.** Point `SAT_TRACKER_PARQUET_ROOT` and
-  `SAT_TRACKER_SATCAT_PARQUET_ROOT` at `s3://` URIs. No other change.
+`SAT_TRACKER_SATCAT_PARQUET_ROOT` at `s3://` URIs. No other change.
 - **UT1 from IERS earth-orientation data**, removing the ~0.4 km
-  approximation `frames` currently accepts. Only worth doing once SGP4's
-  own drift stops dominating, i.e. with element sets hours rather than days
-  old.
+approximation `frames` currently accepts. Only worth doing once SGP4's
+own drift stops dominating, i.e. with element sets hours rather than days
+old.
 - **Vectorised frame conversion.** Not needed for single-instant snapshots;
-  the trigger is multi-timestamp ground tracks, where the scalar loop would
-  cost ~13 s.
+the trigger is multi-timestamp ground tracks, where the scalar loop would
+cost ~13 s.
 - **Object history.** `silver.space_object` is Type-1. SATCAT is a mutable,
-  overwriting source, so `dbt snapshot` is the correct tool here — the
-  opposite conclusion to `silver.elset`, for the opposite reason.
+overwriting source, so `dbt snapshot` is the correct tool here — the
+opposite conclusion to `silver.elset`, for the opposite reason.
 - **SDS group support.** `fetch_omm_sds_group` encodes only the first
-  object returned; the `OMM` FlatBuffer schema describes one satellite.
+object returned; the `OMM` FlatBuffer schema describes one satellite.
 - **Debris classification (stretch).** `dim_object.object_type` now
-  provides the labels, with realistic class balance — 35,834 DEB, 27,398
-  PAY, 6,878 R/B, 160 UNK — which the `GROUP=active` alternative would not
-  have.
+provides the labels, with realistic class balance — 35,834 DEB, 27,398
+PAY, 6,878 R/B, 160 UNK — which the `GROUP=active` alternative would not
+have.
+

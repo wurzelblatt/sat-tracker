@@ -36,6 +36,20 @@ pytestmark = pytest.mark.skipif(
 SNAPSHOT_TS = datetime(2026, 8, 16, 12, 0, 0, tzinfo=UTC)
 EPOCH = datetime(2026, 8, 16, 6, 0, 0, tzinfo=UTC)
 
+TEST_TABLE = "gold.position_snapshot_pytest"
+"""Scratch table these tests write to instead of the real snapshot.
+
+`write_position_snapshot` truncates its whole destination — that is its
+contract — so it cannot be scoped the way `test_postgres_loader.py` scopes
+its writes with a distinctive `source_file`. Pointing the tests at a
+throwaway table is the only way the suite can exercise the real TRUNCATE
+and COPY without destroying whatever snapshot the developer had.
+
+Built with `INCLUDING ALL` so it carries the generated `geo_point` column
+and the indexes; without those, the geography and proximity tests below
+would pass against a table that is not shaped like the real one.
+"""
+
 
 def _position(norad_cat_id: int, latitude: float, longitude: float) -> Position:
     """Build a position with a recognisable latitude and longitude."""
@@ -57,29 +71,61 @@ def _position(norad_cat_id: int, latitude: float, longitude: float) -> Position:
 
 
 def _count() -> int:
-    """Count the rows currently in the snapshot table."""
+    """Count the rows currently in the scratch table."""
     with psycopg.connect(settings.postgres_dsn) as connection:
-        result = connection.execute("SELECT count(*) FROM gold.position_snapshot")
+        result = connection.execute(f"SELECT count(*) FROM {TEST_TABLE}")
         row = result.fetchone()
     assert row is not None
     return row[0]
 
 
 @pytest.fixture(autouse=True)
-def clean_snapshot():
-    """Leave the snapshot table empty before and after each test."""
+def scratch_table():
+    """Create a throwaway clone of the snapshot table, and drop it afterwards.
+
+    `INCLUDING ALL` copies the generated `geo_point` expression and the
+    GIST index, so these tests exercise the real DDL rather than a
+    simplified stand-in. The real `gold.position_snapshot` is never
+    touched.
+    """
     with psycopg.connect(settings.postgres_dsn) as connection:
-        connection.execute("TRUNCATE gold.position_snapshot")
+        connection.execute(f"DROP TABLE IF EXISTS {TEST_TABLE}")
+        connection.execute(
+            f"CREATE TABLE {TEST_TABLE} "
+            "(LIKE gold.position_snapshot INCLUDING ALL)"
+        )
         connection.commit()
     yield
     with psycopg.connect(settings.postgres_dsn) as connection:
-        connection.execute("TRUNCATE gold.position_snapshot")
+        connection.execute(f"DROP TABLE IF EXISTS {TEST_TABLE}")
         connection.commit()
+
+
+def test_the_real_snapshot_table_is_never_touched() -> None:
+    """The suite must not destroy a developer's snapshot.
+
+    It did once: an autouse fixture truncated gold.position_snapshot
+    before and after every test, so running `pytest` silently wiped a
+    freshly propagated snapshot. This test pins the fix.
+    """
+    with psycopg.connect(settings.postgres_dsn) as connection:
+        before = connection.execute(
+            "SELECT count(*) FROM gold.position_snapshot"
+        ).fetchone()
+
+    write_position_snapshot([_position(1, 10.0, 20.0)], table=TEST_TABLE)
+
+    with psycopg.connect(settings.postgres_dsn) as connection:
+        after = connection.execute(
+            "SELECT count(*) FROM gold.position_snapshot"
+        ).fetchone()
+
+    assert before == after
 
 
 def test_writes_every_position() -> None:
     """Each position becomes one row."""
-    written = write_position_snapshot([_position(1, 10.0, 20.0), _position(2, -5.0, 30.0)])
+    written = write_position_snapshot([_position(1, 10.0, 20.0), _position(2, -5.0, 30.0)], table=TEST_TABLE)
 
     assert written == 2
     assert _count() == 2
@@ -87,8 +133,8 @@ def test_writes_every_position() -> None:
 
 def test_a_second_run_replaces_rather_than_appends() -> None:
     """The table holds exactly one snapshot, so a rerun must not accumulate."""
-    write_position_snapshot([_position(1, 10.0, 20.0), _position(2, -5.0, 30.0)])
-    write_position_snapshot([_position(3, 1.0, 2.0)])
+    write_position_snapshot([_position(1, 10.0, 20.0), _position(2, -5.0, 30.0)], table=TEST_TABLE)
+    write_position_snapshot([_position(3, 1.0, 2.0)], table=TEST_TABLE)
 
     assert _count() == 1
 
@@ -99,9 +145,9 @@ def test_an_empty_write_leaves_the_previous_snapshot_alone() -> None:
     Truncating on empty would blank the map whenever propagation failed,
     which is exactly when you would want the last known positions.
     """
-    write_position_snapshot([_position(1, 10.0, 20.0)])
+    write_position_snapshot([_position(1, 10.0, 20.0)], table=TEST_TABLE)
 
-    assert write_position_snapshot([]) == 0
+    assert write_position_snapshot([], table=TEST_TABLE) == 0
     assert _count() == 1
 
 
@@ -113,12 +159,12 @@ def test_geo_point_is_generated_from_latitude_and_longitude() -> None:
     in the wrong hemisphere. Nothing else in the suite can catch that,
     because the DDL is what does the conversion.
     """
-    write_position_snapshot([_position(25544, 51.5, -0.13)])
+    write_position_snapshot([_position(25544, 51.5, -0.13)], table=TEST_TABLE)
 
     with psycopg.connect(settings.postgres_dsn) as connection:
         row = connection.execute(
             "SELECT ST_Y(geo_point::geometry), ST_X(geo_point::geometry) "
-            "FROM gold.position_snapshot WHERE norad_cat_id = 25544"
+            f"FROM {TEST_TABLE} WHERE norad_cat_id = 25544"
         ).fetchone()
 
     assert row is not None
@@ -128,11 +174,13 @@ def test_geo_point_is_generated_from_latitude_and_longitude() -> None:
 
 def test_the_spatial_index_answers_a_proximity_query() -> None:
     """A written row must be findable by the query the map will actually ask."""
-    write_position_snapshot([_position(1, 52.52, 13.40), _position(2, -33.9, 151.2)])
+    write_position_snapshot(
+        [_position(1, 52.52, 13.40), _position(2, -33.9, 151.2)], table=TEST_TABLE
+    )
 
     with psycopg.connect(settings.postgres_dsn) as connection:
         row = connection.execute(
-            "SELECT norad_cat_id FROM gold.position_snapshot "
+            f"SELECT norad_cat_id FROM {TEST_TABLE} "
             "WHERE ST_DWithin(geo_point, "
             "ST_SetSRID(ST_MakePoint(13.40, 52.52), 4326)::geography, 50000)"
         ).fetchall()

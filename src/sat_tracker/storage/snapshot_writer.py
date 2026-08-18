@@ -46,7 +46,7 @@ _TABLE = "gold.position_snapshot"
 _COLUMNS = tuple(field.name for field in fields(Position))
 
 
-def write_position_snapshot(positions: list[Position]) -> int:
+def write_position_snapshot(positions: list[Position], table: str = _TABLE) -> int:
     """Replace the stored snapshot with `positions`, atomically.
 
     Args:
@@ -56,6 +56,15 @@ def write_position_snapshot(positions: list[Position]) -> int:
             and nothing is truncated, because an empty write is far more
             likely to be an upstream failure than a real report that no
             satellite exists.
+        table: Destination table. Defaults to `gold.position_snapshot`.
+
+            This exists because the function's contract is "replace
+            everything", which cannot be scoped the way
+            `postgres_loader` scopes its damage with a `source_file`
+            filter. Without it, testing this function against a
+            development warehouse necessarily destroys whatever snapshot
+            was there — which it did, once. Tests target a scratch table
+            instead. It is also the seam a blue/green write would need.
 
     Returns:
         The number of rows written. Zero when `positions` is empty, in
@@ -74,9 +83,9 @@ def write_position_snapshot(positions: list[Position]) -> int:
         psycopg.connect(settings.postgres_dsn) as connection,
         connection.cursor() as cursor,
     ):
-        cursor.execute(f"TRUNCATE {_TABLE}")
+        cursor.execute(f"TRUNCATE {table}")
 
-        with cursor.copy(f"COPY {_TABLE} ({columns}) FROM STDIN") as copy:
+        with cursor.copy(f"COPY {table} ({columns}) FROM STDIN") as copy:
             for position in positions:
                 copy.write_row(astuple(position))
 
@@ -85,7 +94,7 @@ def write_position_snapshot(positions: list[Position]) -> int:
     logger.info(
         "Wrote %d positions to %s at %s",
         len(positions),
-        _TABLE,
+        table,
         positions[0].snapshot_ts.isoformat(),
     )
     return len(positions)
