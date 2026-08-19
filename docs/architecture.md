@@ -173,6 +173,7 @@ drops it to `WARNING`.
 | `sat-tracker-load`      | CSV → Parquet → Postgres, dispatching per dataset |
 | `sat-tracker-transform` | Run dbt: staging, silver, gold, and all tests     |
 | `sat-tracker-propagate` | SGP4 + TEME→WGS84 → `gold.position_snapshot`      |
+| `sat-tracker-map`       | Streamlit map, propagating on demand              |
 
 
 Keeping the stages separate is deliberate: an orchestrator should call
@@ -597,6 +598,138 @@ non-issue for an on-demand snapshot. **The trigger for revisiting** is
 multi-timestamp ground tracks: `SatrecArray` handles many times in one
 call, but the conversion loop would become ~1.5 M iterations, about 13 s.
 
+### `tracks` — one satellite over one revolution
+
+`elements` answers "where is everything now". `tracks` answers "where does
+one object go", sampling a single satellite across its own orbital period
+so the result draws as a line.
+
+**`Satrec.sgp4_array`, not `SatrecArray`.** The latter propagates many
+satellites across a *shared* list of instants, and each satellite needs its
+own: a LEO revolution is 93 minutes, a geostationary one 1,436. A shared
+window would truncate the slow orbits or oversample the fast ones. The
+period comes from `1440 / mean_motion` — the element set's own value, not
+SATCAT's rounded summary.
+
+**Ground track or orbit path — the same motion in two frames, and only one
+of them closes.**
+
+| | GMST used | Closes? | Drawn on |
+|---|---|---|---|
+| Ground track | each sample's own | No — drifts ~29° west per ISS revolution | Flat map |
+| Orbit path | frozen at the snapshot instant | Yes | Globe |
+
+A ground track is the line of places the satellite passed *over*, and the
+Earth turns beneath it as it goes — that westward march is what makes a
+ground track a sinusoid rather than a loop. Freezing GMST rotates every
+sample by the same angle, leaving the orbital ellipse itself, rigidly
+positioned against the Earth as it is at that instant. The entire
+difference is which Julian date the rotation is taken at.
+
+Capped at 25 traces. Not a performance limit but a legibility one: the
+full catalogue would be ~1.5 million vertices that read as noise.
+
+## Presentation (`sat_tracker.app`)
+
+A Streamlit map, launched by `sat-tracker-map`.
+
+**It propagates on demand rather than reading `gold.position_snapshot`.**
+That follows the project's stance that "real time" means computing
+positions when someone asks, not streaming them: a full catalogue takes
+about a third of a second, cheaper than keeping a table current. The
+snapshot table keeps its role as the PostGIS artifact an orchestrator
+writes and spatial queries run against — the map simply does not need to
+go through it.
+
+**Caching is split deliberately.** Element sets and the object dimension
+change only when the pipeline runs, so both are cached for the session.
+The propagation is cached on *the instant it was computed for*, so
+changing a filter reuses existing positions while Refresh computes new
+ones. Without that split, every checkbox click would re-propagate 16,000
+objects.
+
+Because `fact_propagatable_elset` deliberately carries the element set
+only, object type and regime come from a separate cached `dim_object`
+query, joined in pandas. That is the cost of keeping the fact clean.
+
+### Colour
+
+Points are coloured by **orbital regime** — identity, not magnitude —
+using the first three slots of the categorical palette in their
+dark-surface steps. Validated all-pairs: worst CVD separation ΔE 9.4,
+worst normal-vision ΔE 20.9, all three above 3:1 contrast.
+
+A map is an **all-pairs** form — any two colours can land beside each
+other, unlike segments in a stack — and a fourth categorical slot does not
+clear the separation floors. So `unknown` folds to a recessive grey rather
+than taking a fourth hue.
+
+**Staleness is deliberately not a colour.** Colour follows the entity, and
+overloading it would make a stale LEO satellite indistinguishable from a
+fresh MEO one. It appears as a count, a per-regime flag and an optional
+filter — 48 h for LEO, 96 h for GEO/HEO, 168 h for MEO, because negligible
+drag makes high orbits predictable and a flat threshold would wrongly flag
+a fifth of Galileo.
+
+Tracing a satellite fades the rest to alpha 40 rather than filtering them
+away: one orbit is only legible against the objects it sits among. Regime
+hue survives the fade, so alpha carries focus while hue keeps carrying
+identity.
+
+### The globe, and why it is rendered differently
+
+`st.pydeck_chart` **cannot draw a globe**. Streamlit ships a trimmed
+deck.gl build with no `@deck.gl/globe` module, so a `_GlobeView` spec
+produces correct JSON that the frontend cannot resolve — and it silently
+falls back to a flat `MapView`, which looks like the toggle doing nothing.
+
+pydeck's own `to_html` loads the full deck.gl bundle from a CDN, so the
+globe is written out as a complete page and embedded in an iframe. Two
+costs, both surfaced in the UI:
+
+- **It needs the network** for the deck.gl bundle. The land outlines are
+  local; deck.gl is not.
+- **Clicks cannot come back.** An iframe has no channel into Python, so
+  selection is flat-map only. Name search works on both.
+
+A globe cannot use raster basemap tiles either — they are Mercator images
+and will not drape on a sphere — so the planet is drawn from vector
+geometry: a `SolidPolygonLayer` for the ocean and Natural Earth country
+outlines from `assets/land.json`.
+
+Satellites are placed at **true altitude**, with an opt-in exaggeration
+slider. True scale is the default and stays honest:
+
+| | Height, as a fraction of Earth's 6,371 km radius |
+|---|---|
+| ISS (420 km) | 6.6% |
+| GPS (20,200 km) | 3.2× |
+| Geostationary (35,786 km) | 5.6× |
+
+So LEO genuinely does hug the surface. Exaggerating separates it, at the
+cost of no longer showing the real geometry — which is why it must be
+asked for rather than happening silently.
+
+### The antimeridian, twice
+
+`PathLayer` interpolates between vertices in longitude/latitude space
+*before* projecting, so a step from 179° to −179° is read as −358°. The
+two projections therefore need **mirror-image** treatments of one problem:
+
+| | Symptom | Fix |
+|---|---|---|
+| Flat map | A line straight across the canvas | **Split** the path into segments |
+| Globe | A sweep the long way round, as a band parallel to the equator | **Unwrap** longitudes into a continuous run past ±180° |
+
+Applying either fix to the wrong projection makes things worse: splitting
+a globe path leaves a gap in a continuous orbit, and unwrapping a flat
+path draws off the canvas. Longitudes outside ±180 are valid on a sphere —
+181° *is* −179° — and a high-inclination orbit crosses the antimeridian
+twice per revolution, so one closed path can legitimately run past ±540°.
+
+The globe embeds its data inline rather than streaming it, so the frame is
+trimmed from 20 columns to 10 before rendering: 14.1 MB → 7.0 MB.
+
 ## Data flow (current state)
 
 Row counts are from a real run, and each is reproducible from the CSV
@@ -619,6 +752,11 @@ gold.fact_propagatable_elset
 gold.position_snapshot
                      16,340   = 16,342 − 2 SGP4 declined
 ```
+
+The Streamlit map does not appear in that chain: it reads
+`fact_propagatable_elset` and `dim_object` and propagates in-process, so
+its positions are current to the moment rather than to the last
+`sat-tracker-propagate` run.
 
 `data/` and `notebooks/` are gitignored — ingested data, the Parquet
 datasets, the volume ledger and ad hoc notebooks are runtime artifacts, not
@@ -655,7 +793,7 @@ the real landing zones or the volume ledger.
 - `mock_celestrak_response` — patches `requests.Session.get`, supporting
 `text=`, `json_body=`, and `status_code=` (default `200`).
 
-**120 Python tests plus 48 dbt tests.** (A full `dbt build` reports
+**220 Python tests plus 48 dbt tests.** (A full `dbt build` reports
 `PASS=54`, which counts nodes — 48 tests plus 6 models.) Coverage includes both formats
 (single + group), the compliance shield (fresh/stale cache, fail-fast on
 multiple error statuses), the metadata sidecar's structure, the dataset

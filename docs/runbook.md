@@ -252,6 +252,37 @@ The nearest objects should be LEO satellites a few hundred km up. Anything
 else — geostationary objects at the top, or coordinates over the Arabian
 Sea — points at a coordinate bug rather than an unusual sky.
 
+### The map
+
+The interactive view. Unlike every other command it writes nothing — it
+propagates in-process and renders, so what it shows is current to the
+moment rather than to the last `sat-tracker-propagate` run.
+
+```bash
+uv run sat-tracker-map
+```
+
+Opens on `http://localhost:8501`, and blocks until `Ctrl+C`.
+
+What the controls do:
+
+| Control | Effect |
+|---|---|
+| **Refresh positions** | Re-propagates to now. Filters reuse the existing positions, so only this recomputes |
+| **Projection** | Flat map or globe. See the caveats below |
+| **Altitude scale** | Globe only. True scale by default; exaggeration separates LEO at the cost of the real geometry |
+| **Regime / type / altitude / name** | Filter what is drawn |
+| **Hide stale element sets** | Judged per regime — 48 h LEO, 96 h GEO/HEO, 168 h MEO |
+| **Trace the orbit of** | Draws one full revolution. Up to 25 at once |
+
+Clicking a satellite on the **flat map** traces its orbit and fades
+everything else. On the globe, use the name search instead — the reason is
+under [Troubleshooting](#the-globe-is-blank-or-shows-a-flat-map).
+
+The flat map draws the **ground track**, which drifts west each orbit as
+the Earth turns beneath it. The globe draws the **closed orbit** at true
+altitude. Both are correct; they are the same motion in two frames.
+
 ### Logging verbosity
 
 `INFO`-level logging (including compliance-shield decisions like cache
@@ -482,6 +513,34 @@ debugger:
 ```bash
 uv run pytest tests/test_frames.py tests/test_snapshot_writer.py -q
 ```
+
+### The globe is blank, or shows a flat map
+
+Two different faults with the same first symptom.
+
+**A flat map when the globe is selected** means the deck.gl build in use
+has no globe module. Streamlit ships a trimmed bundle without it, so a
+`_GlobeView` spec silently falls back to `MapView`. The app works around
+this by rendering the globe as an embedded page instead of through
+`st.pydeck_chart`; if you see a flat map on the globe setting, that
+workaround has regressed.
+
+**A blank frame** means the embedded page could not load deck.gl, which it
+fetches from a CDN. Check the network. The land outlines are local, but the
+library is not — the flat map keeps working offline.
+
+**Clicks doing nothing on the globe** is expected and cannot be fixed: an
+iframe has no channel back into Python. Selection works on the flat map;
+name search works on both.
+
+### The map is slow to interact with
+
+The globe embeds all its data inline in the page, so every rerun hands the
+browser a document of a few megabytes to parse. Narrowing the filters
+before switching to the globe is the cheapest remedy.
+
+The flat map does not have this problem — it sends a JSON spec over
+Streamlit's socket and the data never enters the DOM.
 
 ### Postgres connection refused
 

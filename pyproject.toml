@@ -11,13 +11,16 @@ dependencies = [
     "dbt-core>=1.12.2",
     "dbt-postgres>=1.11.0",
     "numpy>=2.5.1",
+    "pandas>=3.0.5",
     "psycopg[binary]>=3.3.4",
     "pyarrow>=25.0.1",
+    "pydeck>=0.9.3",
     "pydantic>=2.13.4",
     "pydantic-settings>=2.14.2",
     "requests>=2.34.2",
     "sgp4>=2.27",
     "spacedatastandards-org>=23.3.3.0.3.7",
+    "streamlit>=1.59.1",
 ]
 
 [project.scripts]
@@ -26,6 +29,7 @@ sat-tracker-satcat = "sat_tracker.cli:satcat"
 sat-tracker-load = "sat_tracker.cli:load"
 sat-tracker-transform = "sat_tracker.cli:transform"
 sat-tracker-propagate = "sat_tracker.cli:propagate"
+sat-tracker-map = "sat_tracker.app:run"
 
 [build-system]
 requires = ["uv_build>=0.11.8,<0.12.0"]
@@ -34,7 +38,6 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "ipykernel>=7.3.0",
-    "pandas>=3.0.5",
     "pytest>=9.1.1",
     "ruff>=0.16.1",
 ]

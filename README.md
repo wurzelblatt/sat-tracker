@@ -8,11 +8,11 @@ propagates every tracked object with SGP4 into a PostGIS table of where
 things are right now.
 
 > **Status:** capstone project in progress. The pipeline is complete end to
-> end — ingestion, bronze, silver, gold and SGP4 propagation — with 120
-> Python tests and 48 dbt tests. A Streamlit map and Airflow orchestration
-> are what remain. See [`docs/architecture.md`](docs/architecture.md) for
-> design rationale and [`docs/runbook.md`](docs/runbook.md) for day-to-day
-> operation.
+> end — ingestion, bronze, silver, gold, SGP4 propagation and an interactive
+> map — with 220 Python tests and 48 dbt tests. Airflow orchestration and a
+> Terraform slice are what remain. See
+> [`docs/architecture.md`](docs/architecture.md) for design rationale and
+> [`docs/runbook.md`](docs/runbook.md) for day-to-day operation.
 
 At the time of writing it tracks **16,340 objects**, propagated from
 element sets averaging 12 hours old.
@@ -49,6 +49,13 @@ element sets averaging 12 hours old.
   position somewhere real.
 - **PostGIS serving table** with a generated `geography` column and a GIST
   index, so "what is within 50 km of here" is a range scan.
+- **An interactive map** that propagates on demand rather than reading a
+  stored snapshot, in both Mercator and globe projections. Click a
+  satellite to trace its orbit: the flat map draws the ground track that
+  marches west as the Earth turns beneath it, the globe draws the closed
+  orbit at true altitude. Confidence is expressed as element-set age
+  judged *per orbital regime*, because high orbits are predictable and a
+  flat staleness threshold would libel a fifth of Galileo.
 - Type-safe, environment-overridable configuration via
   `pydantic-settings`.
 
@@ -82,6 +89,9 @@ uv run sat-tracker-transform
 # Propagate every current element set to now
 uv run sat-tracker-propagate
 
+# Or explore it interactively
+uv run sat-tracker-map
+
 # Which satellites are closest to Berlin right now?
 docker compose exec postgres psql -U sat_tracker -d sat_tracker -c "
 SELECT d.object_name, d.orbit_regime,
@@ -114,9 +124,12 @@ src/sat_tracker/
 │   ├── parquet_writer.py     # landed CSV → partitioned Parquet
 │   ├── postgres_loader.py    # Parquet → bronze tables (idempotent)
 │   └── snapshot_writer.py    # positions → gold.position_snapshot
-└── propagate/
-    ├── frames.py             # TEME → WGS84 (GMST rotation + Bowring)
-    └── elements.py           # warehouse rows → SatrecArray → positions
+├── propagate/
+│   ├── frames.py             # TEME → WGS84 (GMST rotation + Bowring)
+│   ├── elements.py           # warehouse rows → SatrecArray → positions
+│   └── tracks.py             # one satellite over one revolution
+├── app.py                    # Streamlit map, propagating on demand
+└── assets/land.json          # country outlines for the globe view
 transform/                    # dbt project (in-repo profiles.yml)
 ├── models/staging/           # casts bronze TEXT → real types
 ├── models/silver/            # elset (SCD-2), space_object (current state)
@@ -130,7 +143,7 @@ reports/                      # per-step write-ups
 tests/                        # pytest suite, mirrors src/ layout
 ```
 
-The five CLI commands map one-to-one onto pipeline stages:
+The six CLI commands map one-to-one onto pipeline stages:
 
 | Command | Stage |
 |---|---|
@@ -139,6 +152,7 @@ The five CLI commands map one-to-one onto pipeline stages:
 | `sat-tracker-load` | landings → Parquet → `bronze.*` |
 | `sat-tracker-transform` | dbt: staging → silver → gold |
 | `sat-tracker-propagate` | SGP4 → `gold.position_snapshot` |
+| `sat-tracker-map` | Streamlit map, propagating in-process |
 
 Each works standalone, so an orchestrator is thin operators over commands
 that already run on their own — and a scheduling problem can never
