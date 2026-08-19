@@ -210,6 +210,46 @@ docker compose exec postgres psql -U sat_tracker -d sat_tracker -c \
   "SELECT count(*), count(*) FILTER (WHERE is_current) FROM silver.elset;"
 ```
 
+### Browsing the dbt lineage graph
+
+dbt builds a static documentation site from the project: every model with
+its description and columns, the compiled SQL, and an interactive DAG of
+how the layers connect.
+
+```bash
+uv run dbt docs generate --project-dir transform --profiles-dir transform
+uv run dbt docs serve   --project-dir transform --profiles-dir transform --port 8081
+```
+
+**Use `--port 8081`.** `dbt docs serve` defaults to 8080, which is also
+Airflow's port — whichever starts first wins and the second fails with
+"address already in use". Airflow's 8080 is the near-universal convention,
+so dbt is the one that moves.
+
+`generate` needs the warehouse running: it queries Postgres for column
+types and table sizes. `serve` is only a static file server over
+`transform/target/`, so it works offline once generated. `Ctrl+C` stops it.
+
+The lineage graph is the blue circle at the bottom right. It is built from
+`ref()` and `source()` rather than by parsing SQL, which is why those
+functions exist — the same graph determines build order and what
+`--select stg_celestrak_satcat+` expands to. The picture and the execution
+plan are the same object.
+
+**Where the tests are, which is not obvious.** Only the two *singular*
+tests appear under `Tests` in the sidebar, because that tree mirrors the
+file layout and singular tests are the only ones with their own `.sql`
+files. The other 46 are *generic* tests declared in YAML and attached to
+model columns — open a model page and they appear in its Columns table.
+That is the browsable form of `_gold_models.yml` and friends.
+
+The site documents **what is guarded, not whether it passed**. Results live
+in `run_results.json`; `uv run sat-tracker-transform --command test` is the
+question "is it passing?".
+
+`transform/target/` is gitignored, so the site is a local artifact.
+`target/index.html` is self-contained if you want to publish it.
+
 ### Propagating positions
 
 The final stage: run SGP4 over every current element set, convert TEME to
@@ -327,7 +367,8 @@ rather than defining its own Postgres for the data.
 First start takes a few minutes: the image installs the project into its
 own virtualenv, and `standalone` runs database migrations before serving.
 The UI comes up on **http://localhost:8080**, user `admin`, with a
-generated password:
+generated password. Note `dbt docs serve` defaults to the same port — see
+[Browsing the dbt lineage graph](#browsing-the-dbt-lineage-graph).
 
 ```bash
 docker compose -f docker-compose.airflow.yml exec airflow \
