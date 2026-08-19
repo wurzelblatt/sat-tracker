@@ -69,6 +69,22 @@ Any CelesTrak GP group name is valid (`starlink`, `oneweb`, `gps-ops`,
 `active`, ...) — see https://celestrak.org/NORAD/elements/ for the full
 list.
 
+**`active` is not everything.** It means *operational*, so defunct
+payloads, spent rocket bodies and most debris are excluded. CelesTrak
+publishes no "all objects" group; the widest public coverage comes from
+`active` plus the three named breakup groups:
+
+```bash
+uv run sat-tracker-ingest --group active --format csv --load
+uv run sat-tracker-ingest --group fengyun-1c-debris --format csv --load
+uv run sat-tracker-ingest --group cosmos-2251-debris --format csv --load
+uv run sat-tracker-ingest --group iridium-33-debris --format csv --load
+```
+
+That reaches ~18,992 of the 34,512 objects SATCAT lists as in orbit.
+See `architecture.md` for why the rest are unreachable without
+Space-Track credentials.
+
 > **Note:** `--format sds` with `--group` only encodes the *first*
 > object CelesTrak returns for that group, because the `OMM` FlatBuffer
 > schema represents a single record. Use `--format csv` for bulk groups

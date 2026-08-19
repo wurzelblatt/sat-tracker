@@ -120,6 +120,41 @@ SATCAT is fetched through the same compliance shield but with its own
 file: CelesTrak rebuilds it about once a day, so the GP feed's 2-hour
 window would only re-download identical bytes.
 
+### What the pipeline can and cannot see
+
+SATCAT lists **34,512** objects in Earth orbit. The pipeline has element
+sets for **18,992** of them — about 55%. That gap is a property of the
+data source, not a defect, and it is worth stating plainly:
+
+**CelesTrak's public GP endpoint has no "all objects" group.** It serves
+curated subsets — `active`, `starlink`, `gps-ops`, three named debris
+events, and so on. `active` means *operational*, so defunct payloads,
+spent rocket bodies and most debris have no published element sets there.
+
+| Type | In orbit | With element sets |
+|---|---|---|
+| PAY | 19,681 | 16,351 |
+| DEB | 12,488 | 2,639 |
+| R/B | 2,290 | 2 |
+| UNK | 53 | 0 |
+
+The debris figure comes from ingesting the three breakup groups CelesTrak
+does publish — `fengyun-1c-debris`, `cosmos-2251-debris` and
+`iridium-33-debris`, the historical events that produced most catalogued
+debris. The remaining ~9,800 debris objects are tracked by SATCAT but have
+no public GP data.
+
+**This asymmetry is exactly why `dim_object` holds the full catalogue.** A
+dimension filtered to what the fact contains would have quietly redefined
+"everything in orbit" as "everything we happen to have", and the 45% gap
+would be invisible. Holding all 70,000 objects makes it measurable, which
+is the difference between a known limitation and an unknown one.
+
+Closing the gap properly means **Space-Track.org**, which publishes GP for
+every tracked object but requires an account and a US Data Use Agreement.
+`Settings` is already shaped to take a second source; the work is an
+authenticated client and a different rate-limit regime, not a redesign.
+
 **Known limitation:** the `OMM` FlatBuffer schema encodes a single
 satellite record. `fetch_omm_sds_group` therefore only encodes the
 *first* object returned for a group — for bulk constellations, prefer

@@ -14,14 +14,18 @@ things are right now.
 > [`docs/architecture.md`](docs/architecture.md) for design rationale and
 > [`docs/runbook.md`](docs/runbook.md) for day-to-day operation.
 
-At the time of writing it tracks **16,340 objects**, propagated from
-element sets averaging 12 hours old.
+At the time of writing it tracks **18,992 objects** — about 55% of
+everything SATCAT lists as in orbit, which is as far as CelesTrak's public
+feed reaches — propagated from element sets averaging 18 hours old.
 
 ## Features
 
 - **Two CelesTrak feeds.** Orbital elements for a single satellite, a group
   (`starlink`, `active`, `gps-ops`, ...), plus the full ~70,000-object
-  SATCAT catalogue that makes the objects describable.
+  SATCAT catalogue that makes the objects describable. Holding the whole
+  catalogue rather than just what has elements is what makes the coverage
+  gap measurable: 34,512 objects are in orbit, 18,992 have public element
+  sets, and the difference is visible instead of silently redefined away.
 - **CelesTrak Compliance Shield** — an identifying User-Agent, a daily
   download budget enforced before the request, per-feed local caching (2 h
   for elements, 24 h for the catalogue), `ETag`/`If-None-Match` conditional
