@@ -914,3 +914,38 @@ def test_the_globe_payload_carries_the_new_columns() -> None:
 
     for column in ("speed_km_s", "owner", "launch_date", "launch_site_name"):
         assert column in trimmed.columns
+
+
+def test_orbit_paths_scale_with_the_same_exaggeration_as_the_dots() -> None:
+    """A satellite must never be drawn floating off its own orbit.
+
+    `add_elevation` lifts the dots and `tracks_to_paths` lifts the paths.
+    If only one honours the slider, the dot moves outward while the orbit
+    stays pinned at true altitude, and the two visibly separate.
+    """
+    track = _track([(0.0, 10.0, 420.0), (1.0, 20.0, 420.0)])
+    frame = _frame()
+
+    for exaggeration in (1.0, 5.0, 20.0):
+        dot = add_elevation(frame, exaggeration).loc[0, "elevation_m"]
+        path = tracks_to_paths(
+            [track], globe=True, exaggeration=exaggeration
+        )[0]["path"][0][2]
+
+        assert path == pytest.approx(dot)
+
+
+def test_paths_default_to_true_scale() -> None:
+    """Omitting the argument must not silently exaggerate."""
+    track = _track([(0.0, 10.0, 420.0), (1.0, 20.0, 420.0)])
+
+    assert tracks_to_paths([track], globe=True)[0]["path"][0][2] == 420_000.0
+
+
+def test_exaggeration_does_not_reach_the_flat_map() -> None:
+    """A Mercator path has no altitude component to scale."""
+    track = _track([(0.0, 10.0, 420.0), (1.0, 20.0, 420.0)])
+
+    vertex = tracks_to_paths([track], globe=False, exaggeration=10.0)[0]["path"][0]
+
+    assert len(vertex) == 2

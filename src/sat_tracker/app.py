@@ -493,7 +493,9 @@ def traced_orbits(
     return tracks_module.orbit_tracks(selected, when, ground_track=ground_track)
 
 
-def _selected_paths(object_names: list[str], *, globe: bool) -> list[dict]:
+def _selected_paths(
+    object_names: list[str], *, globe: bool, exaggeration: float = 1.0
+) -> list[dict]:
     """Trace the selected satellites and shape them for the path layer.
 
     Args:
@@ -516,6 +518,7 @@ def _selected_paths(object_names: list[str], *, globe: bool) -> list[dict]:
             ground_track=not globe,
         ),
         globe=globe,
+        exaggeration=exaggeration,
     )
 
 
@@ -670,7 +673,9 @@ def unwrap_longitudes(
     return unwrapped
 
 
-def tracks_to_paths(tracks: list[Track], *, globe: bool) -> list[dict]:
+def tracks_to_paths(
+    tracks: list[Track], *, globe: bool, exaggeration: float = 1.0
+) -> list[dict]:
     """Turn orbit tracks into the path records a `PathLayer` draws.
 
     Args:
@@ -680,6 +685,11 @@ def tracks_to_paths(tracks: list[Track], *, globe: bool) -> list[dict]:
             treatments: a flat map draws a line across the canvas if the
             path is not cut, while a globe sweeps the long way round if
             the longitudes are not made continuous.
+        exaggeration: Altitude multiplier, which must match the one
+            applied to the satellite dots by `add_elevation`. If the two
+            disagree, a satellite is drawn floating off the orbit it is
+            actually flying — the dots move outward with the slider and
+            the paths stay pinned at true altitude.
 
     Returns:
         One record per drawable segment, each with a `path` of
@@ -698,7 +708,7 @@ def tracks_to_paths(tracks: list[Track], *, globe: bool) -> list[dict]:
         )
         for segment in segments:
             path = [
-                [longitude, latitude, altitude * 1000.0]
+                [longitude, latitude, altitude * 1000.0 * exaggeration]
                 if globe
                 else [longitude, latitude]
                 for latitude, longitude, altitude in segment
@@ -1131,7 +1141,7 @@ def main() -> None:
                 st.rerun()
 
     globe = projection == "Globe"
-    paths = _selected_paths(traced_names, globe=globe)
+    paths = _selected_paths(traced_names, globe=globe, exaggeration=exaggeration)
     focused = apply_focus(visible, set(traced_names))
 
     if globe:
