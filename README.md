@@ -8,9 +8,9 @@ propagates every tracked object with SGP4 into a PostGIS table of where
 things are right now.
 
 > **Status:** capstone project in progress. The pipeline is complete end to
-> end — ingestion, bronze, silver, gold, SGP4 propagation and an interactive
-> map — with 220 Python tests and 48 dbt tests. Airflow orchestration and a
-> Terraform slice are what remain. See
+> end — ingestion, bronze, silver, gold, SGP4 propagation, an interactive
+> map and Airflow orchestration — with 233 Python tests and 48 dbt tests. A
+> Terraform slice is what remains. See
 > [`docs/architecture.md`](docs/architecture.md) for design rationale and
 > [`docs/runbook.md`](docs/runbook.md) for day-to-day operation.
 
@@ -157,6 +157,12 @@ The six CLI commands map one-to-one onto pipeline stages:
 | `sat-tracker-transform` | dbt: staging → silver → gold |
 | `sat-tracker-propagate` | SGP4 → `gold.position_snapshot` |
 | `sat-tracker-map` | Streamlit map, propagating in-process |
+
+Airflow schedules the first five every two hours, as `BashOperator` tasks
+over those same commands — see
+[`docs/runbook.md`](docs/runbook.md#scheduling-with-airflow). It is optional
+and lives in its own compose file: orchestration is never a prerequisite
+for running the pipeline.
 
 Each works standalone, so an orchestrator is thin operators over commands
 that already run on their own — and a scheduling problem can never
