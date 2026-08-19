@@ -29,12 +29,14 @@ from sat_tracker.app import (
     _build_deck,
     add_colours,
     add_elevation,
+    add_speed,
     apply_filters,
     apply_focus,
     attach_dimension,
     classify_staleness,
     globe_html,
     load_land,
+    name_launch_sites,
     positions_to_frame,
     selected_names,
     split_at_antimeridian,
@@ -83,14 +85,23 @@ def _dimension(**overrides) -> pd.DataFrame:
 
 
 def _frame(**overrides) -> pd.DataFrame:
-    """Build a fully prepared one-row frame, ready for filtering."""
+    """Build a fully prepared one-row frame, ready for filtering.
+
+    Runs the same steps in the same order as `snapshot_frame`, so a
+    column added to the real pipeline cannot go missing here. Keeping
+    the two in step by hand is what let a fixture claim `object_name`
+    the production query did not select, and 25 passing tests coexist
+    with a broken app.
+    """
     positions = positions_to_frame([_position(1, **{
         k: v for k, v in overrides.items() if k == "epoch_age_hours"
     })])
     dimension = _dimension(
         **{k: v for k, v in overrides.items() if k != "epoch_age_hours"}
     )
-    return add_colours(classify_staleness(attach_dimension(positions, dimension)))
+    frame = attach_dimension(positions, dimension)
+    frame = name_launch_sites(add_speed(frame))
+    return add_colours(classify_staleness(frame))
 
 
 # ── positions_to_frame ───────────────────────────────────────────────
@@ -591,8 +602,10 @@ def test_the_globe_frame_keeps_only_what_it_draws() -> None:
     trimmed = trim_for_globe(add_elevation(_frame()))
 
     assert list(trimmed.columns) == list(GLOBE_RENDER_COLUMNS)
-    assert "position_x_km" not in trimmed.columns
-    assert "owner" not in trimmed.columns
+    # The TEME state vector is never drawn or tooltipped, so it is dead
+    # weight in a document the browser has to parse.
+    for unused in ("position_x_km", "velocity_x_km_s", "epoch", "snapshot_ts"):
+        assert unused not in trimmed.columns
 
 
 def test_the_globe_frame_keeps_every_row() -> None:
@@ -818,3 +831,86 @@ def test_the_globe_unwraps_where_the_flat_map_splits() -> None:
     # And the unbroken one never asks the renderer to go the long way.
     longitudes = [vertex[0] for vertex in globe_paths[0]["path"]]
     assert max(abs(b - a) for a, b in pairwise(longitudes)) < 180.0
+
+
+# ── Speed and launch site ────────────────────────────────────────────
+
+
+def test_speed_is_the_magnitude_of_the_velocity_vector() -> None:
+    """SGP4 already returns velocity; this only takes its length."""
+    frame = _frame()  # velocity components are (-1.5, 6.9, 3.2)
+
+    expected = (1.5**2 + 6.9**2 + 3.2**2) ** 0.5
+
+    assert add_speed(frame).loc[0, "speed_km_s"] == pytest.approx(expected)
+
+
+def test_speed_is_positive_regardless_of_direction() -> None:
+    """A magnitude has no sign, whichever way the satellite is travelling."""
+    frame = _frame()
+    frame.loc[0, ["velocity_x_km_s", "velocity_y_km_s", "velocity_z_km_s"]] = [
+        -7.0, -1.0, -2.0
+    ]
+
+    assert add_speed(frame).loc[0, "speed_km_s"] > 0
+
+
+def test_a_low_orbit_speed_is_about_seven_and_a_half() -> None:
+    """The sanity check for the units.
+
+    A circular low orbit travels near 7.6 km/s. Reporting m/s or km/h
+    would be off by three orders of magnitude and pass every other test
+    here.
+    """
+    frame = _frame()
+    frame.loc[0, ["velocity_x_km_s", "velocity_y_km_s", "velocity_z_km_s"]] = [
+        -1.5, 6.9, 3.2
+    ]
+
+    assert 7.0 < add_speed(frame).loc[0, "speed_km_s"] < 8.0
+
+
+def test_speed_on_an_empty_frame_is_not_an_error() -> None:
+    """Filters can exclude everything."""
+    empty = attach_dimension(positions_to_frame([]), _dimension())
+
+    assert "speed_km_s" in add_speed(empty).columns
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [("AFETR", "Cape Canaveral"), ("TYMSC", "Baikonur"), ("FRGUI", "Kourou")],
+)
+def test_launch_site_codes_become_place_names(code: str, expected: str) -> None:
+    """`AFETR` is Cape Canaveral, which no reader should have to know."""
+    frame = _frame(launch_site=code)
+
+    assert name_launch_sites(frame).loc[0, "launch_site_name"] == expected
+
+
+def test_an_unknown_launch_site_keeps_its_code() -> None:
+    """A code is less useful than a name but far more useful than a blank.
+
+    SATCAT carries a long tail of sites with a handful of objects each,
+    and new ones appear as new pads come into service.
+    """
+    frame = _frame(launch_site="ZZZZZ")
+
+    assert name_launch_sites(frame).loc[0, "launch_site_name"] == "ZZZZZ"
+
+
+def test_a_missing_launch_site_does_not_raise() -> None:
+    """Not every catalogued object records where it launched from."""
+    frame = _frame(launch_site=None)
+
+    assert "launch_site_name" in name_launch_sites(frame).columns
+
+
+def test_the_globe_payload_carries_the_new_columns() -> None:
+    """Speed, owner and launch details must survive the trim for the tooltip."""
+    frame = name_launch_sites(add_speed(_frame()))
+
+    trimmed = trim_for_globe(add_elevation(frame))
+
+    for column in ("speed_km_s", "owner", "launch_date", "launch_site_name"):
+        assert column in trimmed.columns

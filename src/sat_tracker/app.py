@@ -39,6 +39,7 @@ from datetime import UTC, datetime
 from itertools import pairwise
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import psycopg
 import pydeck as pdk
@@ -117,7 +118,45 @@ DIMENSION_COLUMNS = (
     "orbit_regime",
     "owner",
     "launch_date",
+    "launch_site",
 )
+
+# SATCAT records launch sites as opaque codes, so the map expands the ones
+# that actually appear. Covers every site with more than a handful of
+# objects; anything unlisted falls back to its raw code rather than being
+# blanked, since a code is more useful than nothing.
+LAUNCH_SITES: dict[str, str] = {
+    "AFETR": "Cape Canaveral",
+    "AFWTR": "Vandenberg",
+    "PLMSC": "Plesetsk",
+    "TYMSC": "Baikonur",
+    "TAISC": "Taiyuan",
+    "FRGUI": "Kourou",
+    "JSC": "Jiuquan",
+    "SRILR": "Satish Dhawan",
+    "XICLF": "Xichang",
+    "TANSC": "Tanegashima",
+    "VOSTO": "Vostochny",
+    "WSC": "Wenchang",
+    "RLLB": "Mahia, New Zealand",
+    "KYMSC": "Kapustin Yar",
+    "WLPIS": "Wallops Island",
+    "KSCUT": "Uchinoura",
+    "YSLA": "Yellow Sea launch platform",
+    "DLS": "Dombarovsky",
+    "SEAL": "Sea Launch platform",
+    "ERAS": "Eastern Range air launch",
+    "WRAS": "Western Range air launch",
+    "HGSTR": "Hammaguir",
+    "KODAK": "Kodiak",
+    "NSC": "Naro",
+    "SCSLA": "South China Sea platform",
+    "YAVNE": "Palmachim",
+    "SVOBO": "Svobodny",
+    "SEMLS": "Semnan",
+    "SNMLP": "San Marco platform",
+    "SMTS": "Shahrud",
+}
 
 
 _DIMENSION_QUERY = f"SELECT {', '.join(DIMENSION_COLUMNS)} FROM gold.dim_object"
@@ -135,6 +174,10 @@ GLOBE_RENDER_COLUMNS = (
     "longitude_deg",
     "altitude_km",
     "epoch_age_hours",
+    "speed_km_s",
+    "owner",
+    "launch_date",
+    "launch_site_name",
     "colour",
     "elevation_m",
 )
@@ -148,6 +191,7 @@ GLOBE_ROUNDING = {
     "longitude_deg": 3,
     "altitude_km": 1,
     "epoch_age_hours": 1,
+    "speed_km_s": 2,
 }
 
 GLOBE_HEIGHT_PX = 700
@@ -181,6 +225,61 @@ def positions_to_frame(positions: list[Position]) -> pd.DataFrame:
     if not positions:
         return pd.DataFrame(columns=[field for field in Position.__dataclass_fields__])
     return pd.DataFrame([asdict(position) for position in positions])
+
+
+def add_speed(frame: pd.DataFrame) -> pd.DataFrame:
+    """Attach orbital speed, from the velocity vector SGP4 already returned.
+
+    The magnitude of the TEME velocity, so this is **inertial** speed —
+    motion relative to the stars, not relative to the ground beneath.
+    The two differ by up to Earth's surface rotation, about 0.46 km/s at
+    the equator. Inertial is the honest number here because it is what
+    the propagator computes; converting to ground-relative would mean
+    subtracting the rotation vector, which is a different question.
+
+    Expect roughly 7.7 km/s in low orbit and 3.1 km/s at geostationary
+    altitude: orbital speed falls as the orbit widens.
+
+    Args:
+        frame: Positions carrying the three TEME velocity components.
+
+    Returns:
+        The frame with a `speed_km_s` column added.
+    """
+    if frame.empty:
+        return frame.assign(speed_km_s=pd.Series(dtype=float))
+
+    return frame.assign(
+        speed_km_s=np.sqrt(
+            frame["velocity_x_km_s"] ** 2
+            + frame["velocity_y_km_s"] ** 2
+            + frame["velocity_z_km_s"] ** 2
+        )
+    )
+
+
+def name_launch_sites(frame: pd.DataFrame) -> pd.DataFrame:
+    """Expand SATCAT's launch-site codes into readable place names.
+
+    `AFETR` is Cape Canaveral and `TYMSC` is Baikonur, which no reader
+    should be expected to know.
+
+    Args:
+        frame: Positions carrying `launch_site`.
+
+    Returns:
+        The frame with a `launch_site_name` column. An unrecognised code
+        falls through to itself rather than becoming blank — a code is
+        less useful than a name but far more useful than nothing.
+    """
+    if frame.empty:
+        return frame.assign(launch_site_name=pd.Series(dtype=object))
+
+    return frame.assign(
+        launch_site_name=frame["launch_site"].map(
+            lambda code: LAUNCH_SITES.get(code, code)
+        )
+    )
 
 
 def attach_dimension(positions: pd.DataFrame, dimension: pd.DataFrame) -> pd.DataFrame:
@@ -436,6 +535,7 @@ def snapshot_frame(when: datetime) -> pd.DataFrame:
     """
     positions = elements.propagate(load_elsets(), when)
     frame = attach_dimension(positions_to_frame(positions), load_dimension())
+    frame = name_launch_sites(add_speed(frame))
     return add_colours(classify_staleness(frame))
 
 
@@ -713,12 +813,15 @@ def _build_deck(
 
     # round altitude and age to 3 and 2 decimal places (cm)
     frame = frame.assign(altitude_km=frame["altitude_km"].round(3),
-                         epoch_age_hours=frame["epoch_age_hours"].round(2))
+                         epoch_age_hours=frame["epoch_age_hours"].round(2),
+                         speed_km_s=frame["speed_km_s"].round(3))
 
     tooltip = {
         "html": "<b>{object_name}</b><br/>"
-        "NORAD {norad_cat_id} · {object_type} · {orbit_regime}<br/>"
-        "{altitude_km} km · element set {epoch_age_hours} h old",
+        "NORAD {norad_cat_id} · {object_type} · {orbit_regime} · {owner}<br/>"
+        "{altitude_km} km · {speed_km_s} km/s<br/>"
+        "launched {launch_date} from {launch_site_name}<br/>"
+        "element set {epoch_age_hours} h old",
     }
 
     # Tracks go underneath the dots, so a satellite is never hidden by
@@ -866,9 +969,12 @@ def _render_table(frame: pd.DataFrame, count: int) -> None:
                     "object_type",
                     "orbit_regime",
                     "owner",
+                    "launch_date",
+                    "launch_site_name",
                     "latitude_deg",
                     "longitude_deg",
                     "altitude_km",
+                    "speed_km_s",
                     "epoch_age_hours",
                     "is_stale",
                 ]
