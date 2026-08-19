@@ -373,6 +373,17 @@ docker compose -f docker-compose.airflow.yml down        # keep metadata
 docker compose -f docker-compose.airflow.yml down -v     # forget run history
 ```
 
+The Airflow stack declares its own compose project name, so it owns
+`sat_tracker_airflow_default` and joins the warehouse's network as an
+external. Without that both files would inherit `sat_tracker` from the
+directory, share one `default` network, and every `down` would fail trying
+to remove a network the warehouse containers are still attached to.
+
+**Run it only when you need it.** Idle, Airflow costs about 1.5 GB and 14%
+CPU — four processes (scheduler, api-server, dag-processor, triggerer)
+heartbeating in one container. On a machine where Docker has a small share
+of the RAM, that is enough to make everything else feel slow.
+
 ### Airflow tasks are killed with no log output
 
 A task log that stops after `Pre Execute`, with the scheduler reporting

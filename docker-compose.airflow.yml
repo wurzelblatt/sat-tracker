@@ -10,6 +10,17 @@
 # Requires the warehouse to be running first: this file joins its network
 # rather than defining its own Postgres for the data.
 
+# Its own project name, rather than inheriting `sat_tracker` from the
+# directory as docker-compose.yml does. Without this both files claim the
+# same project, so their `default` networks are the SAME network — and
+# `down` then tries to remove one the warehouse containers are still
+# attached to, which fails every time.
+#
+# With a distinct name this stack owns `sat_tracker_airflow_default` and
+# joins the warehouse's network as an external, so tearing Airflow down
+# leaves the warehouse untouched and exits cleanly.
+name: sat_tracker_airflow
+
 services:
   # Airflow's own metadata: DAG runs, task instances, connections, XComs.
   # A separate instance from the warehouse on purpose — Airflow's
@@ -87,8 +98,9 @@ volumes:
   airflow_logs:
 
 networks:
-  # Created by docker-compose.yml. Joining it is what lets the tasks reach
-  # `postgres:5432` by name; without it they would resolve nothing.
+  # Created by docker-compose.yml, and external here so this stack never
+  # tries to manage it. Joining it is what lets tasks reach `postgres:5432`
+  # by name; without it they would resolve nothing.
   warehouse:
     external: true
     name: sat_tracker_default
