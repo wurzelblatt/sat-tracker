@@ -1,0 +1,94 @@
+# Airflow, scheduling the pipeline.
+#
+# Deliberately a SEPARATE compose file from docker-compose.yml. Every
+# stage runs standalone, so orchestration must never be a prerequisite for
+# running the pipeline — `docker compose up -d` still gets you a warehouse
+# with no Airflow anywhere near it.
+#
+#   docker compose -f docker-compose.airflow.yml up -d --build
+#
+# Requires the warehouse to be running first: this file joins its network
+# rather than defining its own Postgres for the data.
+
+services:
+  # Airflow's own metadata: DAG runs, task instances, connections, XComs.
+  # A separate instance from the warehouse on purpose — Airflow's
+  # bookkeeping does not belong in a medallion architecture, and keeping
+  # them apart means tearing Airflow down never touches ingested data.
+  airflow-postgres:
+    image: postgres:17-alpine
+    container_name: sat_tracker_airflow_db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  airflow:
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    container_name: sat_tracker_airflow
+    # `standalone` runs the api-server, scheduler, dag-processor and
+    # triggerer in one process, and provisions an admin user on first
+    # start. Airflow 3 split those into separate commands; for a local
+    # demo, one container that just works is worth more than a faithful
+    # reproduction of a production topology.
+    command: standalone
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+        postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+
+      # The warehouse, as seen from inside the compose network: the
+      # SERVICE NAME and the CONTAINER port. The 5433 in the default DSN
+      # is a mapping onto the developer's machine and means nothing here.
+      # Overriding it costs one variable precisely because the DSN was a
+      # Settings field rather than a hardcoded string.
+      SAT_TRACKER_POSTGRES_DSN: >-
+        postgresql://sat_tracker:sat_tracker@postgres:5432/sat_tracker
+
+      # dbt does not read Settings — it has its own connection config in
+      # transform/profiles.yml, parameterised by these variables. So the
+      # same database needs describing twice, in two vocabularies. Set
+      # only the DSN and ingest/load/propagate connect happily while
+      # `transform` reaches for localhost:5433, which inside a container
+      # is the container itself.
+      SAT_TRACKER_POSTGRES_HOST: postgres
+      SAT_TRACKER_POSTGRES_PORT: "5432"
+
+      AIRFLOW__API_AUTH__JWT_SECRET: sat-tracker-local-only
+    ports:
+      - "8080:8080"
+    volumes:
+      # The landing zone is genuinely shared state: the ingest task writes
+      # a CSV that the load task has to read. Everything else about the
+      # project is baked into the image.
+      - ./data:/opt/airflow/sat_tracker/data
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - airflow_logs:/opt/airflow/logs
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+    networks:
+      - default
+      - warehouse
+
+volumes:
+  airflow_db_data:
+  airflow_logs:
+
+networks:
+  # Created by docker-compose.yml. Joining it is what lets the tasks reach
+  # `postgres:5432` by name; without it they would resolve nothing.
+  warehouse:
+    external: true
+    name: sat_tracker_default

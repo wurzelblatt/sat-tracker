@@ -23,6 +23,10 @@ notebooks/
 # OS cruft
 .DS_Store
 
+# Airflow runtime state (logs, standalone's generated admin password)
+airflow/logs/
+airflow/standalone_admin_password.txt
+
 # Tool caches
 .pytest_cache/
 .ruff_cache/
