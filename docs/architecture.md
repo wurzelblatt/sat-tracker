@@ -765,6 +765,61 @@ twice per revolution, so one closed path can legitimately run past ±540°.
 The globe embeds its data inline rather than streaming it, so the frame is
 trimmed from 20 columns to 10 before rendering: 14.1 MB → 7.0 MB.
 
+## Orchestration (`airflow/`)
+
+Optional, and a separate compose file: every stage runs standalone, so
+orchestration is never a prerequisite for running the pipeline.
+
+```
+ingest_gp ─────┐
+               ├──► load ──► transform ──► propagate
+ingest_satcat ─┘
+```
+
+Six `BashOperator` tasks over commands that already work on their own, so
+the DAG contains **no pipeline logic**. That is what stops a scheduling
+problem masquerading as a data problem, and it makes the DAG portable:
+moving to ECS or Kubernetes changes what each task *invokes*, not what the
+graph *means*.
+
+**`transform` depends on both ingests**, not on GP alone. That is not
+tidiness — `dim_object.is_decayed` is only as fresh as the SATCAT pull
+behind it, and a GP refresh on its own leaves recently re-entered objects
+looking alive. Two satellites were caught by exactly that during
+development, so the dependency is encoded where it cannot be forgotten.
+
+**Retries are safe by construction**, decided long before Airflow existed:
+ingestion caches per feed and replays an ETag; loading is `COPY` plus
+`ON CONFLICT DO NOTHING`; `dbt build` rebuilds from bronze and exits
+non-zero on a failed test; propagation replaces the snapshot in one
+transaction.
+
+**Scheduled every 2 hours**, matching CelesTrak's GP recompute cycle and
+the client's cache TTL. Faster would gain nothing — the compliance shield
+would serve the cached file and make no request.
+
+### Two things containerising exposed
+
+Both were cases of code that worked on the host and broke once moved,
+because a container changes where the code sits relative to what it needs.
+
+**Two configuration paths to one database.** `Settings` drives the Python
+stages via `SAT_TRACKER_POSTGRES_DSN`; dbt has its own config in
+`transform/profiles.yml`, parameterised by `SAT_TRACKER_POSTGRES_HOST` and
+`_PORT`. Both are properly env-var driven, but they are different
+vocabularies for the same database — set only the DSN and `transform`
+alone fails, reaching for a port mapping that exists only on the
+developer's machine.
+
+**The project needs its own virtualenv, and it must not re-sync.** Airflow
+and dbt-core pin overlapping dependencies to different ranges, so the
+project is installed into a separate environment via `uv` and tasks call
+`uv run`. That environment is synced once at image build; the DAG passes
+`--no-sync` so tasks do not re-resolve it. Without that flag, five wheel
+builds per run starved the scheduler of CPU until its heartbeat stalled
+and the supervisor SIGKILLed the tasks — a failure that reports as "killed"
+and never as "slow".
+
 ## Data flow (current state)
 
 Row counts are from a real run, and each is reproducible from the CSV

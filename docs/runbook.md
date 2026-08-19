@@ -310,6 +310,103 @@ uv run sat-tracker-ingest --group starlink --format csv --quiet
 
 Every command accepts it.
 
+## Scheduling with Airflow
+
+Optional, and deliberately a **separate compose file**: every stage runs
+standalone, so orchestration must never become a prerequisite for running
+the pipeline.
+
+```bash
+docker compose up -d                                          # warehouse first
+docker compose -f docker-compose.airflow.yml up -d --build    # then Airflow
+```
+
+The warehouse must be up first — the Airflow compose joins its network
+rather than defining its own Postgres for the data.
+
+First start takes a few minutes: the image installs the project into its
+own virtualenv, and `standalone` runs database migrations before serving.
+The UI comes up on **http://localhost:8080**, user `admin`, with a
+generated password:
+
+```bash
+docker compose -f docker-compose.airflow.yml exec airflow \
+  cat /opt/airflow/simple_auth_manager_passwords.json.generated
+```
+
+The DAG ships **paused**. Unpause it in the UI, or:
+
+```bash
+docker compose -f docker-compose.airflow.yml exec airflow \
+  airflow dags unpause sat_tracker_pipeline
+
+docker compose -f docker-compose.airflow.yml exec airflow \
+  airflow dags trigger sat_tracker_pipeline
+```
+
+A full run takes about 10 minutes:
+
+| Task | Typical |
+|---|---|
+| `ingest_gp` | 98 s |
+| `ingest_satcat` | 126 s |
+| `load` | 175 s |
+| `transform` | 96 s |
+| `propagate` | 91 s |
+
+**Changing pipeline code needs an image rebuild.** The project is baked
+into the image so `uv sync` happens once at build rather than per task;
+only `data/` is mounted, because that is genuinely shared state between
+the ingest and load stages.
+
+```bash
+docker compose -f docker-compose.airflow.yml up -d --build
+```
+
+Editing the DAG itself does **not** need a rebuild — `airflow/dags/` is
+bind-mounted and re-parsed automatically.
+
+Tear it down without touching the warehouse:
+
+```bash
+docker compose -f docker-compose.airflow.yml down        # keep metadata
+docker compose -f docker-compose.airflow.yml down -v     # forget run history
+```
+
+The Airflow stack declares its own compose project name, so it owns
+`sat_tracker_airflow_default` and joins the warehouse's network as an
+external. Without that both files would inherit `sat_tracker` from the
+directory, share one `default` network, and every `down` would fail trying
+to remove a network the warehouse containers are still attached to.
+
+**Run it only when you need it.** Idle, Airflow costs about 1.5 GB and 14%
+CPU — four processes (scheduler, api-server, dag-processor, triggerer)
+heartbeating in one container. On a machine where Docker has a small share
+of the RAM, that is enough to make everything else feel slow.
+
+### Airflow tasks are killed with no log output
+
+A task log that stops after `Pre Execute`, with the scheduler reporting
+`Heartbeat recovered after N seconds` and `exit_code=SIGKILL`, means the
+container is CPU-starved rather than that the command failed.
+
+The cause seen here was `uv run` re-resolving and rebuilding the project on
+every task, even though the image had synced it at build time. Five wheel
+builds per run saturated the CPU, the scheduler's heartbeat stalled, and
+the supervisor killed the very tasks doing the work. The DAG therefore
+calls `uv run --no-sync`, which is load-bearing rather than an
+optimisation.
+
+### `transform` fails with `connection to server at "localhost", port 5433`
+
+dbt does not read `Settings`. It has its own connection config in
+`transform/profiles.yml`, parameterised by `SAT_TRACKER_POSTGRES_HOST` and
+`SAT_TRACKER_POSTGRES_PORT`. Setting only `SAT_TRACKER_POSTGRES_DSN` gets
+the Python stages connecting while `transform` reaches for the developer's
+port mapping, which inside a container is the container itself.
+
+Both must be set. `docker-compose.airflow.yml` sets all three.
+
 ## Rebuilding the warehouse from scratch
 
 Needed whenever `sql/init/*.sql` or the Postgres image changes, since those
