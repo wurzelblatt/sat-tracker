@@ -397,6 +397,49 @@ the supervisor killed the very tasks doing the work. The DAG therefore
 calls `uv run --no-sync`, which is load-bearing rather than an
 optimisation.
 
+### A Postgres container exits with `could not find the database system`
+
+The log contradicts itself:
+
+```
+PostgreSQL Database directory appears to contain a database; Skipping initialization
+...
+could not open file "/var/lib/postgresql/data/global/pg_control": No such file or directory
+```
+
+Postgres decides whether a data directory is already initialised by
+checking that it is **non-empty**, then trusts that judgement. A container
+stopped seconds after its first start leaves a few files behind but no
+`pg_control` — enough to fail the emptiness check, not enough to run. The
+volume is then permanently unusable, because every subsequent start makes
+the same wrong decision.
+
+This is a generic Postgres failure mode, not specific to this project. It
+shows up after an interrupted first start: a `down` issued while the
+container was still initialising, a laptop sleeping, or a build timing out.
+
+The fix is to discard the half-written volume so initialisation can run
+properly:
+
+```bash
+# Airflow's metadata — holds DAG run history and nothing else
+docker compose -f docker-compose.airflow.yml down -v
+docker compose -f docker-compose.airflow.yml up -d
+```
+
+For the **warehouse** the same fix applies but costs more, since it drops
+every table:
+
+```bash
+docker compose down -v
+docker compose up -d
+uv run sat-tracker-load && uv run sat-tracker-transform
+```
+
+That is cheap here only because Postgres is derived — the CSV landing zone
+is the source of truth. See
+[Rebuilding the warehouse from scratch](#rebuilding-the-warehouse-from-scratch).
+
 ### `transform` fails with `connection to server at "localhost", port 5433`
 
 dbt does not read `Settings`. It has its own connection config in
