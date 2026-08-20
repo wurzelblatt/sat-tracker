@@ -47,7 +47,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from sat_tracker.config import settings
-from sat_tracker.propagate import elements
+from sat_tracker.propagate import elements, frames
 from sat_tracker.propagate import tracks as tracks_module
 from sat_tracker.propagate.elements import Elset, Position
 from sat_tracker.propagate.tracks import Track
@@ -88,6 +88,9 @@ FADED_ALPHA = 40
 FULL_ALPHA = 255
 
 MAX_TRACKS = 25
+
+# Where the observer stands until told otherwise.
+DEFAULT_OBSERVER = (52.52, 13.40)
 
 
 # How old an element set may be before its position is worth flagging.
@@ -342,6 +345,96 @@ def add_colours(frame: pd.DataFrame) -> pd.DataFrame:
             lambda regime: REGIME_COLOURS.get(regime, NEUTRAL_COLOUR)
         )
     )
+
+
+def add_look_angles(
+    frame: pd.DataFrame,
+    observer_latitude: float,
+    observer_longitude: float,
+    observer_altitude_km: float = 0.0,
+) -> pd.DataFrame:
+    """Attach where each satellite appears from a point on the ground.
+
+    ── Why the satellite is converted back to ECEF ──────────────────
+    `Position` carries geodetic latitude, longitude and altitude, not an
+    Earth-fixed vector, and look angles need both bodies in the same
+    Cartesian frame before they can be subtracted. `geodetic_to_ecef` is
+    exact and closed-form, and the round trip through it recovers the
+    position `ecef_to_geodetic` started from to well under a millimetre,
+    so nothing is lost by going back.
+
+    The alternative — rotating the stored TEME vector with
+    `teme_to_ecef` — would need the propagation instant threaded down
+    here as well, for a result identical to the millimetre.
+
+    Args:
+        frame: Positions carrying `latitude_deg`, `longitude_deg` and
+            `altitude_km`.
+        observer_latitude: Observer geodetic latitude in degrees.
+        observer_longitude: Observer longitude in degrees.
+        observer_altitude_km: Observer height above the ellipsoid.
+
+    Returns:
+        The frame with `azimuth_deg`, `elevation_deg` and `range_km`
+        added. Elevation is the one that matters: positive means above
+        the observer's horizon.
+    """
+    if frame.empty:
+        return frame.assign(
+            azimuth_deg=pd.Series(dtype=float),
+            elevation_deg=pd.Series(dtype=float),
+            range_km=pd.Series(dtype=float),
+        )
+
+    observer_ecef = frames.geodetic_to_ecef(
+        observer_latitude, observer_longitude, observer_altitude_km
+    )
+
+    angles = [
+        frames.ecef_to_look_angles(
+            observer_ecef,
+            frames.geodetic_to_ecef(latitude, longitude, altitude),
+            observer_latitude,
+            observer_longitude,
+        )
+        for latitude, longitude, altitude in zip(
+            frame["latitude_deg"],
+            frame["longitude_deg"],
+            frame["altitude_km"],
+            strict=True,
+        )
+    ]
+
+    return frame.assign(
+        azimuth_deg=[a[0] for a in angles],
+        elevation_deg=[a[1] for a in angles],
+        range_km=[a[2] for a in angles],
+    )
+
+
+def filter_visible(frame: pd.DataFrame, minimum_elevation: float) -> pd.DataFrame:
+    """Keep only what is above the observer's horizon.
+
+    ── What "visible" means here ────────────────────────────────────
+    Geometric visibility: the satellite is above the local horizontal.
+    NOT optical visibility, which additionally requires the satellite to
+    be sunlit and the observer to be in darkness — that needs a solar
+    ephemeris and Earth's shadow cone, and is a different piece of work.
+
+    Args:
+        frame: Positions carrying `elevation_deg`.
+        minimum_elevation: Degrees above the horizon to require. Zero is
+            the true geometric horizon; ten is a more honest floor for a
+            real sky, where buildings, trees and haze eat the first few
+            degrees.
+
+    Returns:
+        The filtered frame.
+    """
+    if frame.empty:
+        return frame
+
+    return frame[frame["elevation_deg"] >= minimum_elevation]
 
 
 def apply_focus(frame: pd.DataFrame, traced_names: set[str]) -> pd.DataFrame:
@@ -970,25 +1063,30 @@ def _render_table(frame: pd.DataFrame, count: int) -> None:
         frame: The filtered positions.
         count: How many rows are shown, for the expander's label.
     """
+    columns = [
+        "norad_cat_id",
+        "object_name",
+        "object_type",
+        "orbit_regime",
+        "owner",
+        "launch_date",
+        "launch_site_name",
+        "latitude_deg",
+        "longitude_deg",
+        "altitude_km",
+        "speed_km_s",
+        "epoch_age_hours",
+        "is_stale",
+    ]
+    # Look angles only exist when an observer has been set, and they are
+    # the first thing you want when they do — so they lead the table
+    # rather than trailing twelve columns of context.
+    if "elevation_deg" in frame.columns:
+        columns = ["azimuth_deg", "elevation_deg", "range_km", *columns]
+
     with st.expander(f"Table view — {count:,} objects"):
         st.dataframe(
-            frame[
-                [
-                    "norad_cat_id",
-                    "object_name",
-                    "object_type",
-                    "orbit_regime",
-                    "owner",
-                    "launch_date",
-                    "launch_site_name",
-                    "latitude_deg",
-                    "longitude_deg",
-                    "altitude_km",
-                    "speed_km_s",
-                    "epoch_age_hours",
-                    "is_stale",
-                ]
-            ],
+            frame[columns],
             use_container_width=True,
             hide_index=True,
         )
@@ -1088,6 +1186,30 @@ def main() -> None:
             "republish far less often — a flat threshold would wrongly flag them.",
         )
 
+        st.divider()
+        st.subheader("Visible from")
+
+        observe = st.checkbox(
+            "Only what is above the horizon",
+            help="Geometric visibility — the satellite is above the local "
+            "horizontal. Not optical visibility, which also needs the "
+            "satellite sunlit and the observer in darkness.",
+        )
+        observer_lat = st.number_input(
+            "Latitude", value=DEFAULT_OBSERVER[0], min_value=-90.0,
+            max_value=90.0, step=0.01, format="%.4f",
+        )
+        observer_lon = st.number_input(
+            "Longitude", value=DEFAULT_OBSERVER[1], min_value=-180.0,
+            max_value=180.0, step=0.01, format="%.4f",
+        )
+        minimum_elevation = st.slider(
+            "Minimum elevation", 0, 60, 10, step=5, format="%d°",
+            help="0° is the true geometric horizon. 10° is a more honest "
+            "floor for a real sky, where buildings and haze eat the first "
+            "few degrees.",
+        )
+
     visible = apply_filters(
         frame,
         regimes=regimes,
@@ -1097,11 +1219,19 @@ def main() -> None:
         hide_stale=hide_stale,
     )
 
+    if observe:
+        visible = filter_visible(
+            add_look_angles(visible, observer_lat, observer_lon), minimum_elevation
+        )
+
     tracked, stale = len(visible), int(visible["is_stale"].sum()) if len(visible) else 0
     left, middle, right = st.columns(3)
     left.metric("Objects shown", f"{tracked:,}")
     middle.metric("Of the catalogue", f"{len(frame):,}")
-    right.metric("Stale for their regime", f"{stale:,}")
+    if observe:
+        right.metric(f"Above {minimum_elevation}° from here", f"{tracked:,}")
+    else:
+        right.metric("Stale for their regime", f"{stale:,}")
 
     _render_legend()
 

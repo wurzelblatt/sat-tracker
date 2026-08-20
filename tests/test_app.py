@@ -29,11 +29,13 @@ from sat_tracker.app import (
     _build_deck,
     add_colours,
     add_elevation,
+    add_look_angles,
     add_speed,
     apply_filters,
     apply_focus,
     attach_dimension,
     classify_staleness,
+    filter_visible,
     globe_html,
     load_land,
     name_launch_sites,
@@ -949,3 +951,105 @@ def test_exaggeration_does_not_reach_the_flat_map() -> None:
     vertex = tracks_to_paths([track], globe=False, exaggeration=10.0)[0]["path"][0]
 
     assert len(vertex) == 2
+
+
+# ── Observer visibility ──────────────────────────────────────────────
+
+BERLIN_LAT, BERLIN_LON = 52.52, 13.40
+
+
+def test_a_satellite_overhead_reads_as_ninety_degrees() -> None:
+    """The app-level check that the observer wiring is the right way round."""
+    frame = _frame()
+    frame.loc[0, ["latitude_deg", "longitude_deg", "altitude_km"]] = [
+        BERLIN_LAT, BERLIN_LON, 400.0
+    ]
+
+    angled = add_look_angles(frame, BERLIN_LAT, BERLIN_LON)
+
+    assert angled.loc[0, "elevation_deg"] == pytest.approx(90.0, abs=1e-6)
+    assert angled.loc[0, "range_km"] == pytest.approx(400.0, abs=1e-6)
+
+
+def test_a_satellite_on_the_far_side_is_below_the_horizon() -> None:
+    """Negative elevation is what the filter exists to remove."""
+    frame = _frame()
+    frame.loc[0, ["latitude_deg", "longitude_deg", "altitude_km"]] = [
+        -BERLIN_LAT, BERLIN_LON - 180.0, 400.0
+    ]
+
+    assert add_look_angles(frame, BERLIN_LAT, BERLIN_LON).loc[0, "elevation_deg"] < 0
+
+
+def test_moving_the_observer_changes_the_angles() -> None:
+    """The observer inputs must actually reach the computation.
+
+    A wiring mistake that ignored them would still produce plausible
+    angles, just always the same ones.
+    """
+    frame = _frame()
+    frame.loc[0, ["latitude_deg", "longitude_deg", "altitude_km"]] = [
+        BERLIN_LAT, BERLIN_LON, 400.0
+    ]
+
+    here = add_look_angles(frame, BERLIN_LAT, BERLIN_LON).loc[0, "elevation_deg"]
+    elsewhere = add_look_angles(frame, -33.9, 151.2).loc[0, "elevation_deg"]
+
+    assert here > 80.0
+    assert elsewhere < 0.0
+
+
+def test_the_horizon_filter_keeps_only_what_is_up() -> None:
+    """Zero degrees is the geometric horizon."""
+    overhead = _frame(object_name="UP")
+    overhead.loc[0, ["latitude_deg", "longitude_deg", "altitude_km"]] = [
+        BERLIN_LAT, BERLIN_LON, 400.0
+    ]
+    below = _frame(object_name="DOWN")
+    below.loc[0, ["latitude_deg", "longitude_deg", "altitude_km"]] = [
+        -BERLIN_LAT, BERLIN_LON - 180.0, 400.0
+    ]
+
+    frame = add_look_angles(
+        pd.concat([overhead, below], ignore_index=True), BERLIN_LAT, BERLIN_LON
+    )
+    kept = filter_visible(frame, 0)
+
+    assert kept["object_name"].tolist() == ["UP"]
+
+
+@pytest.mark.parametrize("threshold", [0, 10, 30, 60])
+def test_a_higher_threshold_never_keeps_more(threshold: int) -> None:
+    """Raising the floor can only remove objects, never add them.
+
+    Guards against a comparison written the wrong way round, which would
+    still return a plausible-looking subset.
+    """
+    frame = _frame()
+    frame.loc[0, ["latitude_deg", "longitude_deg", "altitude_km"]] = [
+        BERLIN_LAT + 3.0, BERLIN_LON, 500.0
+    ]
+    angled = add_look_angles(frame, BERLIN_LAT, BERLIN_LON)
+
+    assert len(filter_visible(angled, threshold)) <= len(filter_visible(angled, 0))
+
+
+def test_an_empty_frame_survives_the_observer_pipeline() -> None:
+    """Filters upstream can exclude everything before the observer runs."""
+    empty = attach_dimension(positions_to_frame([]), _dimension())
+
+    angled = add_look_angles(empty, BERLIN_LAT, BERLIN_LON)
+
+    assert "elevation_deg" in angled.columns
+    assert filter_visible(angled, 10).empty
+
+
+def test_look_angles_leave_the_other_columns_alone() -> None:
+    """Adding three columns must not disturb what the map already draws."""
+    frame = _frame()
+
+    angled = add_look_angles(frame, BERLIN_LAT, BERLIN_LON)
+
+    assert angled.loc[0, "object_name"] == frame.loc[0, "object_name"]
+    assert angled.loc[0, "colour"] == frame.loc[0, "colour"]
+    assert set(frame.columns) <= set(angled.columns)
