@@ -9,7 +9,7 @@ None of these need a database or a browser.
 """
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 
 import pandas as pd
@@ -18,11 +18,13 @@ import pytest
 
 from sat_tracker.app import (
     _DIMENSION_QUERY,
+    COLOUR_SCHEMES,
     DIMENSION_COLUMNS,
     FADED_ALPHA,
     FULL_ALPHA,
     GLOBE_RENDER_COLUMNS,
     NEUTRAL_COLOUR,
+    OBJECT_TYPE_COLOURS,
     REGIME_COLOURS,
     SATELLITE_LAYER_ID,
     STALENESS_THRESHOLD_HOURS,
@@ -36,11 +38,14 @@ from sat_tracker.app import (
     attach_dimension,
     classify_staleness,
     filter_visible,
+    focus_set,
     globe_html,
     load_land,
     name_launch_sites,
+    object_labels,
+    passes_to_frame,
     positions_to_frame,
-    selected_names,
+    selected_ids,
     split_at_antimeridian,
     tracks_to_paths,
     trim_for_globe,
@@ -48,6 +53,7 @@ from sat_tracker.app import (
 )
 from sat_tracker.config import settings
 from sat_tracker.propagate.elements import Position
+from sat_tracker.propagate.passes import Pass
 from sat_tracker.propagate.tracks import Track
 
 SNAPSHOT_TS = datetime(2026, 8, 18, 12, 0, 0, tzinfo=UTC)
@@ -525,11 +531,12 @@ def test_tracing_dims_everything_else() -> None:
     Filtering them away would leave a line with nothing to read it
     against, so they fade rather than disappear.
     """
-    frame = pd.concat(
-        [_frame(object_name="ISS"), _frame(object_name="OTHER")], ignore_index=True
-    )
+    first = _frame(object_name="ISS")
+    second = _frame(object_name="OTHER")
+    second.loc[0, "norad_cat_id"] = 2
+    frame = pd.concat([first, second], ignore_index=True)
 
-    focused = apply_focus(frame, {"ISS"})
+    focused = apply_focus(frame, {1})
 
     assert focused.loc[0, "colour"][3] == FULL_ALPHA
     assert focused.loc[1, "colour"][3] == FADED_ALPHA
@@ -543,7 +550,7 @@ def test_fading_preserves_the_regime_hue() -> None:
     """
     frame = _frame(object_name="OTHER", orbit_regime="LEO")
 
-    faded = apply_focus(frame, {"ISS"}).loc[0, "colour"]
+    faded = apply_focus(frame, {99999}).loc[0, "colour"]
 
     assert faded[:3] == REGIME_COLOURS["LEO"]
 
@@ -555,31 +562,35 @@ def test_focus_is_idempotent() -> None:
     function that appended rather than replaced would produce longer and
     longer colour lists on each click.
     """
-    once = apply_focus(_frame(), {"ISS"})
-    twice = apply_focus(once, {"ISS"})
+    once = apply_focus(_frame(), {1})
+    twice = apply_focus(once, {1})
 
     assert len(twice.loc[0, "colour"]) == 4
 
 
-def test_a_click_yields_the_object_name() -> None:
-    """Streamlit returns the underlying rows, keyed by layer id."""
-    event = {"objects": {SATELLITE_LAYER_ID: [{"object_name": "ISS (ZARYA)"}]}}
+def test_a_click_yields_the_catalog_number() -> None:
+    """Streamlit returns the underlying rows, keyed by layer id.
 
-    assert selected_names(event) == {"ISS (ZARYA)"}
+    The catalog number rather than the name, because names are not
+    unique — 1,938 objects share `FENGYUN 1C DEB`.
+    """
+    event = {"objects": {SATELLITE_LAYER_ID: [{"norad_cat_id": 25544}]}}
+
+    assert selected_ids(event) == {25544}
 
 
-def test_multiple_clicks_yield_multiple_names() -> None:
+def test_multiple_clicks_yield_multiple_ids() -> None:
     """`selection_mode` is multi-object, so several can arrive at once."""
     event = {
-        "objects": {SATELLITE_LAYER_ID: [{"object_name": "A"}, {"object_name": "B"}]}
+        "objects": {SATELLITE_LAYER_ID: [{"norad_cat_id": 1}, {"norad_cat_id": 2}]}
     }
 
-    assert selected_names(event) == {"A", "B"}
+    assert selected_ids(event) == {1, 2}
 
 
 @pytest.mark.parametrize(
     "event",
-    [None, {}, {"objects": {}}, {"objects": {"other_layer": [{"object_name": "A"}]}},
+    [None, {}, {"objects": {}}, {"objects": {"other_layer": [{"norad_cat_id": 1}]}},
      {"objects": {SATELLITE_LAYER_ID: [{}]}}, "not a dict"],
     ids=["none", "empty", "no-layer", "wrong-layer", "no-name", "wrong-type"],
 )
@@ -589,7 +600,7 @@ def test_an_unusable_selection_is_treated_as_no_selection(event: object) -> None
     The event's shape is set by Streamlit and deck.gl rather than by
     this project, so anything unexpected degrades to "nothing selected".
     """
-    assert selected_names(event) == set()
+    assert selected_ids(event) == set()
 
 
 # ── Globe rendering ──────────────────────────────────────────────────
@@ -1053,3 +1064,233 @@ def test_look_angles_leave_the_other_columns_alone() -> None:
     assert angled.loc[0, "object_name"] == frame.loc[0, "object_name"]
     assert angled.loc[0, "colour"] == frame.loc[0, "colour"]
     assert set(frame.columns) <= set(angled.columns)
+
+
+# ── Pass table ───────────────────────────────────────────────────────
+
+
+def _pass(peak_elevation: float = 45.0, truncated: bool = False) -> Pass:
+    """Build one pass with recognisable values."""
+    start = datetime(2026, 8, 21, 5, 22, 0, tzinfo=UTC)
+    return Pass(
+        norad_cat_id=25544,
+        object_name="ISS (ZARYA)",
+        start_utc=start,
+        start_azimuth_deg=263.4,
+        peak_utc=start + timedelta(minutes=3),
+        peak_azimuth_deg=129.2,
+        peak_elevation_deg=peak_elevation,
+        end_utc=start + timedelta(minutes=6, seconds=30),
+        end_azimuth_deg=91.7,
+        duration_minutes=6.5,
+        truncated=truncated,
+    )
+
+
+def test_a_pass_becomes_one_row() -> None:
+    """Each pass is one line of the table."""
+    assert len(passes_to_frame([_pass(), _pass()])) == 2
+
+
+def test_the_pass_table_carries_every_requested_field() -> None:
+    """Start, duration, peak and end, each with its bearing."""
+    row = passes_to_frame([_pass()]).iloc[0]
+
+    assert row["Duration (min)"] == 6.5
+    assert row["Peak el"] == 45.0
+    assert row["Start az"] == 263
+    assert row["Peak az"] == 129
+    assert row["End az"] == 92
+
+
+def test_pass_times_are_rendered_as_strings() -> None:
+    """A pass table is read, not computed with.
+
+    Leaving datetimes in place would render without an explicit zone in
+    some clients, which is a good way to mislead someone about a time
+    they are planning to be outside for.
+    """
+    row = passes_to_frame([_pass()]).iloc[0]
+
+    assert row["Start (UTC)"] == "2026-08-21 05:22:00"
+    assert row["Peak (UTC)"] == "05:25:00"
+
+
+def test_a_truncated_pass_is_flagged() -> None:
+    """Its real start or end lies outside the window, so the time is an edge."""
+    assert bool(passes_to_frame([_pass(truncated=True)]).iloc[0]["Truncated"]) is True
+
+
+def test_an_empty_pass_list_still_has_the_columns() -> None:
+    """A satellite that never rises must render an empty table, not raise."""
+    empty = passes_to_frame([])
+
+    assert empty.empty
+    assert "Start (UTC)" in empty.columns
+    assert "Peak el" in empty.columns
+
+
+# ── Identity: NORAD IDs, not names ───────────────────────────────────
+
+
+def _two_debris_fragments() -> pd.DataFrame:
+    """Two distinct objects sharing one name, as breakup debris does."""
+    first = _frame(object_name="FENGYUN 1C DEB")
+    second = _frame(object_name="FENGYUN 1C DEB")
+    second.loc[0, "norad_cat_id"] = 30000
+    return pd.concat([first, second], ignore_index=True)
+
+
+def test_objects_sharing_a_name_get_separate_entries() -> None:
+    """The bug this fixes.
+
+    All 1,938 Fengyun-1C fragments are catalogued as `FENGYUN 1C DEB`, so
+    a name-keyed selector offered one entry standing for all of them and
+    resolved it to whichever came first. Across the propagatable
+    catalogue 18,992 objects carry only 16,356 distinct names, leaving
+    2,636 unreachable by name at all.
+    """
+    labels = object_labels(_two_debris_fragments())
+
+    assert len(labels) == 2
+    assert set(labels) == {1, 30000}
+
+
+def test_a_label_names_the_object_and_its_number() -> None:
+    """Readable, and unambiguous when the name is not."""
+    assert object_labels(_frame(object_name="ISS (ZARYA)"))[1] == "ISS (ZARYA) · 1"
+
+
+def test_an_unnamed_object_still_gets_a_label() -> None:
+    """A missing name must not drop the object from every selector."""
+    assert object_labels(_frame(object_name=None))[1] == "1"
+
+
+def test_labels_of_an_empty_frame_are_empty() -> None:
+    """Filters can exclude everything before a selector is built."""
+    empty = attach_dimension(positions_to_frame([]), _dimension())
+
+    assert object_labels(empty) == {}
+
+
+def test_focus_distinguishes_objects_sharing_a_name() -> None:
+    """Fading by name would highlight all 1,938 fragments at once."""
+    focused = apply_focus(_two_debris_fragments(), {30000})
+
+    assert focused.loc[0, "colour"][3] == FADED_ALPHA
+    assert focused.loc[1, "colour"][3] == FULL_ALPHA
+
+
+# ── Which satellites the map highlights ──────────────────────────────
+
+
+def test_traced_orbits_are_highlighted() -> None:
+    """The orbit-track selection fades everything else, as before."""
+    assert focus_set([1, 2], None, {1, 2, 3}) == {1, 2}
+
+
+def test_the_pass_target_is_highlighted_too() -> None:
+    """Reading a satellite's passes should show you which one it is.
+
+    The two selections are independent, so both stand out.
+    """
+    assert focus_set([], 25544, {1, 25544}) == {25544}
+
+
+def test_both_selections_combine() -> None:
+    """Tracing one orbit while reading another's passes highlights both."""
+    assert focus_set([1], 2, {1, 2, 3}) == {1, 2}
+
+
+def test_nothing_selected_highlights_nothing() -> None:
+    """An empty set means no fade at all — every object stays opaque."""
+    assert focus_set([], None, {1, 2, 3}) == set()
+
+
+def test_a_selection_no_longer_on_the_map_is_dropped() -> None:
+    """Filters change under a stored choice.
+
+    Keeping an absent selection would fade every visible object to
+    highlight one that is not there — a map that looks broken rather
+    than focused.
+    """
+    assert focus_set([99], 98, {1, 2, 3}) == set()
+
+
+def test_a_partly_stale_selection_keeps_what_survives() -> None:
+    """One selection going out of view must not discard the others."""
+    assert focus_set([1, 99], 2, {1, 2, 3}) == {1, 2}
+
+
+# ── Colouring by object type ─────────────────────────────────────────
+
+
+def test_the_default_scheme_is_orbit_regime() -> None:
+    """Existing behaviour is unchanged when no scheme is named."""
+    assert add_colours(_frame(orbit_regime="LEO")).loc[0, "colour"] == (
+        REGIME_COLOURS["LEO"]
+    )
+
+
+@pytest.mark.parametrize("object_type", list(OBJECT_TYPE_COLOURS))
+def test_each_object_type_gets_its_own_colour(object_type: str) -> None:
+    """Colour carries identity under either scheme."""
+    frame = _frame(object_type=object_type)
+
+    assert add_colours(frame, "Object type").loc[0, "colour"] == (
+        OBJECT_TYPE_COLOURS[object_type]
+    )
+
+
+def test_an_unlisted_object_type_folds_to_neutral() -> None:
+    """A fourth categorical slot does not clear the all-pairs floors.
+
+    UNK has no propagatable objects today, but a map is an all-pairs form
+    and four hues cannot be separated safely — so it takes the recessive
+    grey rather than a generated colour.
+    """
+    assert add_colours(_frame(object_type="UNK"), "Object type").loc[0, "colour"] == (
+        NEUTRAL_COLOUR
+    )
+
+
+def test_the_two_schemes_colour_the_same_object_differently() -> None:
+    """The whole point: one point, two possible identities.
+
+    A LEO payload is blue under regime and blue under type by
+    coincidence, so this uses a MEO payload — orange as a regime, blue as
+    a type.
+    """
+    frame = _frame(orbit_regime="MEO", object_type="PAY")
+
+    by_regime = add_colours(frame, "Orbit regime").loc[0, "colour"]
+    by_type = add_colours(frame, "Object type").loc[0, "colour"]
+
+    assert by_regime != by_type
+
+
+def test_both_schemes_draw_on_the_same_validated_slots() -> None:
+    """Only three hues clear the all-pairs separation floors for a map.
+
+    Reusing them across schemes is safe because the schemes are mutually
+    exclusive, and it means neither has to fall back to an unvalidated
+    fourth colour.
+    """
+    assert set(map(tuple, REGIME_COLOURS.values())) == set(
+        map(tuple, OBJECT_TYPE_COLOURS.values())
+    )
+
+
+def test_every_scheme_names_a_real_column() -> None:
+    """A scheme pointing at a missing column would raise at render time."""
+    frame = _frame()
+
+    for column, _ in COLOUR_SCHEMES.values():
+        assert column in frame.columns
+
+
+def test_colouring_an_empty_frame_is_not_an_error() -> None:
+    """Filters can exclude everything before colours are applied."""
+    empty = attach_dimension(positions_to_frame([]), _dimension())
+
+    assert "colour" in add_colours(empty, "Object type").columns
