@@ -603,6 +603,40 @@ theory and is what `sgp4.omm.initialize` uses. The *ellipsoid* for the
 geodetic conversion is WGS84. Unifying them would cost a few hundred metres
 and look entirely correct.
 
+### `frames` — look angles from a point on the ground
+
+Everything above answers "where is this object". `ecef_to_look_angles`
+answers "where do I look", which needs the observer in the picture:
+
+```
+observer (lat, lon, alt) ──geodetic_to_ecef──▶ observer ECEF
+satellite TEME ──teme_to_ecef──▶ satellite ECEF
+                        │
+                        ▼  d = satellite − observer      ← the range vector
+                        ▼  rotate d into East-North-Up
+              azimuth, elevation, range
+```
+
+**Rotate the range vector, not the satellite's position.** Feeding the
+satellite's own ECEF vector into the rotation gives the direction from the
+*centre of the Earth* — wrong by up to 90° and still a plausible-looking
+bearing. The subtraction is the entire point of the function, and
+`test_the_observer_position_actually_matters` catches its omission by
+requiring two different observers to disagree about the same satellite.
+
+Two smaller traps: `atan2(E, N)` takes **East first**, because azimuth is
+measured clockwise *from* north — the reverse of the usual `atan2(y, x)`.
+And its result runs (−180, 180], so due west arrives as −90 and must be
+normalised to 270.
+
+`geodetic_to_ecef` was promoted out of `tests/test_frames.py`, where it had
+served as the oracle for `ecef_to_geodetic`: the easy, closed-form
+direction used to generate known vectors the hard direction had to invert.
+Placing an observer needs exactly that conversion, so the function written
+to *check* the transform became the one the next feature required. The test
+file now aliases the production version, so the round-trip tests exercise
+what ships.
+
 ### `elements` — warehouse rows to positions
 
 Reads `gold.fact_propagatable_elset`, builds one `Satrec` per satellite via
@@ -664,6 +698,33 @@ difference is which Julian date the rotation is taken at.
 Capped at 25 traces. Not a performance limit but a legibility one: the
 full catalogue would be ~1.5 million vertices that read as noise.
 
+### `passes` — when a satellite is above a given horizon
+
+A search rather than a transformation. Sample the satellite's elevation
+across a window, then find the contiguous runs above a threshold; each run
+is a pass, and its first, last and highest samples give the numbers an
+observer wants.
+
+**Deliberately not an analytic solution.** Root-finding on elevation would
+be more elegant and considerably more fragile: SGP4 has no closed form to
+differentiate, passes arrive in clusters, and a solver landing on the wrong
+root produces a plausible time for a pass that never happens. Dense
+sampling can be *coarse* but cannot be *subtly wrong* — the right trade
+when the output is a time someone will stand outside for.
+
+Three days at 30-second steps is 8,640 samples: one `Satrec.sgp4_array`
+call and a few milliseconds, with the frame conversion the slower half.
+Step size bounds how precisely a pass edge can be located, since the true
+crossing lies inside the last step;
+`test_a_finer_step_locates_the_same_passes` is what justifies 30 seconds,
+by requiring that halving it does not change the count.
+
+A pass touching either end of the window is flagged **truncated**: it was
+already in progress, so the reported start or end is the window's edge
+rather than the real crossing. Geostationary objects are always truncated,
+correctly — they never rise or set from a given place, so a "pass" over one
+is bounded only by how far ahead you looked.
+
 ## Presentation (`sat_tracker.app`)
 
 A Streamlit map, launched by `sat-tracker-map`.
@@ -687,6 +748,19 @@ Because `fact_propagatable_elset` deliberately carries the element set
 only, object type and regime come from a separate cached `dim_object`
 query, joined in pandas. That is the cost of keeping the fact clean.
 
+### Identity is the catalog number, never the name
+
+Every selector — orbit tracks, the pass table, click-to-select, the fade —
+keys on `norad_cat_id`. A name is a label; only the catalog number is an
+identifier, and the distinction is not academic: all **1,938 Fengyun-1C
+fragments share the single name `FENGYUN 1C DEB`**. Across the propagatable
+catalogue, 18,992 objects carry only 16,356 distinct names, so 2,636 are
+unreachable by name at all.
+
+Keying on names worked until debris arrived, because breakup fragments are
+catalogued by event rather than individually. Labels still read
+`NAME · NORAD` so nothing became less legible.
+
 ### Colour
 
 Points are coloured by **orbital regime** — identity, not magnitude —
@@ -699,6 +773,20 @@ other, unlike segments in a stack — and a fourth categorical slot does not
 clear the separation floors. So `unknown` folds to a recessive grey rather
 than taking a fourth hue.
 
+Colour can carry **either** orbital regime or object type, chosen in the
+sidebar. Both schemes draw on the same three validated slots, which is
+safe because they are mutually exclusive and the legend names the active
+one — and it means neither has to fall back to an unvalidated fourth hue.
+The distributions make them complementary rather than redundant: regime
+splits 18,169 LEO / 627 GEO-HEO / 194 MEO, type splits 16,351 PAY / 2,639
+DEB / 2 R/B.
+
+`add_colours` runs *after* the cached propagation rather than inside it.
+Colour depends on a UI toggle, and folding that into the cache key would
+re-propagate 19,000 objects on every switch — a third of a second for what
+should be an instant repaint. **Cached functions key on what the
+computation depends on, never on what the presentation depends on.**
+
 **Staleness is deliberately not a colour.** Colour follows the entity, and
 overloading it would make a stale LEO satellite indistinguishable from a
 fresh MEO one. It appears as a count, a per-regime flag and an optional
@@ -710,6 +798,34 @@ Tracing a satellite fades the rest to alpha 40 rather than filtering them
 away: one orbit is only legible against the objects it sits among. Regime
 hue survives the fade, so alpha carries focus while hue keeps carrying
 identity.
+
+### Observer visibility
+
+An observer position (default Berlin) filters the map to what is above
+that observer's horizon, and a selected satellite gets a three-day pass
+table: start, peak and end, each with a bearing.
+
+Satellites are converted back through `geodetic_to_ecef` so both bodies
+sit in one Cartesian frame before subtracting. The round trip is exact to
+well under a millimetre, and the alternative — rotating the stored TEME
+vector — would need the propagation instant threaded down for an identical
+answer. 0.58 s for 18,992 objects.
+
+**Scope is geometric visibility**: the satellite is above the local
+horizontal. *Not* optical visibility, which additionally requires the
+satellite sunlit and the observer in darkness, and therefore a solar
+ephemeris and Earth's shadow cone. The UI says so rather than leaving the
+distinction to the reader.
+
+From Berlin: 1,225 objects above the horizon, 642 above 10°, 158 above 30°.
+That 6.5% is what the geometry predicts — a visibility footprint grows with
+altitude, covering roughly 3% of Earth's surface at Starlink height and 38%
+at GPS.
+
+Selecting a satellite for passes also fades the rest of the map. Streamlit
+executes top to bottom and that selector sits *below* the map, so the
+widget is keyed and its session value read above: any change reruns the
+whole script, leaving the map never more than one interaction behind.
 
 ### The globe, and why it is rendered differently
 
@@ -883,7 +999,7 @@ the real landing zones or the volume ledger.
 - `mock_celestrak_response` — patches `requests.Session.get`, supporting
 `text=`, `json_body=`, and `status_code=` (default `200`).
 
-**220 Python tests plus 48 dbt tests.** (A full `dbt build` reports
+**311 Python tests plus 48 dbt tests.** (A full `dbt build` reports
 `PASS=54`, which counts nodes — 48 tests plus 6 models.) Coverage includes both formats
 (single + group), the compliance shield (fresh/stale cache, fail-fast on
 multiple error statuses), the metadata sidecar's structure, the dataset

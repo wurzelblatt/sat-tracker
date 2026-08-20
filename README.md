@@ -9,8 +9,8 @@ things are right now.
 
 > **Status:** capstone project in progress. The pipeline is complete end to
 > end — ingestion, bronze, silver, gold, SGP4 propagation, an interactive
-> map and Airflow orchestration — with 233 Python tests and 48 dbt tests. A
-> Terraform slice is what remains. See
+> map, Airflow orchestration and observer pass prediction — with 311 Python
+> tests and 48 dbt tests. A Terraform slice is what remains. See
 > [`docs/architecture.md`](docs/architecture.md) for design rationale and
 > [`docs/runbook.md`](docs/runbook.md) for day-to-day operation.
 
@@ -53,6 +53,11 @@ feed reaches — propagated from element sets averaging 18 hours old.
   position somewhere real.
 - **PostGIS serving table** with a generated `geography` column and a GIST
   index, so "what is within 50 km of here" is a range scan.
+- **Ask what is overhead.** Give it a latitude and longitude and it filters
+  to what is above your horizon, then tabulates when a chosen satellite
+  rises, peaks and sets over the next three days — each with a compass
+  bearing. Geometric visibility, not optical: it does not claim you could
+  see the thing with your eyes.
 - **An interactive map** that propagates on demand rather than reading a
   stored snapshot, in both Mercator and globe projections. Click a
   satellite to trace its orbit: the flat map draws the ground track that
@@ -131,7 +136,8 @@ src/sat_tracker/
 ├── propagate/
 │   ├── frames.py             # TEME → WGS84 (GMST rotation + Bowring)
 │   ├── elements.py           # warehouse rows → SatrecArray → positions
-│   └── tracks.py             # one satellite over one revolution
+│   ├── tracks.py             # one satellite over one revolution
+│   └── passes.py             # when it is above a given horizon
 ├── app.py                    # Streamlit map, propagating on demand
 └── assets/land.json          # country outlines for the globe view
 transform/                    # dbt project (in-repo profiles.yml)
