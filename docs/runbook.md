@@ -330,6 +330,10 @@ What the controls do:
 | **Regime / type / altitude / name** | Filter what is drawn |
 | **Hide stale element sets** | Judged per regime — 48 h LEO, 96 h GEO/HEO, 168 h MEO |
 | **Trace the orbit of** | Draws one full revolution. Up to 25 at once |
+| **Colour by** | Orbital regime or object type. Only one applies, and the legend names it |
+| **Only what is above the horizon** | Filters to what an observer at the given coordinates can see |
+| **Latitude / Longitude** | Where that observer stands. Defaults to Berlin |
+| **Minimum elevation** | 0° is the true horizon; 10° allows for buildings and haze |
 
 Clicking a satellite on the **flat map** traces its orbit and fades
 everything else. On the globe, use the name search instead — the reason is
@@ -338,6 +342,35 @@ under [Troubleshooting](#the-globe-is-blank-or-shows-a-flat-map).
 The flat map draws the **ground track**, which drifts west each orbit as
 the Earth turns beneath it. The globe draws the **closed orbit** at true
 altitude. Both are correct; they are the same motion in two frames.
+
+### Passes over the next 3 days
+
+With an observer set, a table below the map lists when a chosen satellite
+rises, peaks and sets — each with a compass bearing, and the peak with its
+elevation. Selecting a satellite there also fades the rest of the map, so
+the object whose passes you are reading is the one you can see.
+
+Azimuth is degrees clockwise from north: 0 N, 90 E, 180 S, 270 W. Times are
+UTC.
+
+Expect roughly 4–6 ISS passes per day at mid-latitudes, 2–12 minutes each.
+A peak elevation near 70° goes almost overhead; one near 10° skims the
+horizon and is far harder to spot.
+
+**A pass marked `Truncated` was already in progress at a window edge**, so
+its reported start or end is the edge rather than the real crossing, and
+its duration is a lower bound. Two cases produce it: a satellite already
+overhead when the app loaded, and a pass still running three days out.
+Geostationary objects are always truncated — they never rise or set from a
+given place.
+
+Accuracy degrades across the window. SGP4 drifts 1–3 km per day from epoch,
+so with element sets already a day old the far end carries a second or two
+of timing error. Useful; not to be quoted to the second.
+
+**"Visible" here means geometric** — above the local horizontal. It does
+not mean you could see it with your eyes, which additionally requires the
+satellite to be sunlit and you to be in darkness.
 
 ### Logging verbosity
 
