@@ -47,7 +47,8 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from sat_tracker.config import settings
-from sat_tracker.propagate import elements
+from sat_tracker.propagate import elements, frames
+from sat_tracker.propagate import passes as passes_module
 from sat_tracker.propagate import tracks as tracks_module
 from sat_tracker.propagate.elements import Elset, Position
 from sat_tracker.propagate.tracks import Track
@@ -62,6 +63,26 @@ REGIME_COLOURS: dict[str, list[int]] = {
 }
 
 # Recessive grey for `unknown`. Not a categorical slot — see the module docstring.
+# The same three validated slots, assigned to object type. Only one
+# scheme is active at a time, so reusing the palette is not a collision —
+# the legend states which encoding is in force.
+#
+# Three types appear among propagatable objects: PAY 16,351, DEB 2,639,
+# R/B 2. UNK has none today and folds to neutral if it ever does, exactly
+# as `unknown` does for orbital regime.
+OBJECT_TYPE_COLOURS: dict[str, list[int]] = {
+    "PAY": [57, 135, 229],  # blue — payloads
+    "DEB": [217, 89, 38],  # orange — debris
+    "R/B": [25, 158, 112],  # aqua — rocket bodies
+}
+
+# What the map can colour by. Each entry names the column carrying the
+# category and the hues assigned to it.
+COLOUR_SCHEMES: dict[str, tuple[str, dict[str, list[int]]]] = {
+    "Orbit regime": ("orbit_regime", REGIME_COLOURS),
+    "Object type": ("object_type", OBJECT_TYPE_COLOURS),
+}
+
 NEUTRAL_COLOUR = [138, 138, 133]
 
 # Light neutral for orbit tracks, deliberately not a palette hue.
@@ -88,6 +109,14 @@ FADED_ALPHA = 40
 FULL_ALPHA = 255
 
 MAX_TRACKS = 25
+
+# Where the observer stands until told otherwise.
+DEFAULT_OBSERVER = (52.52, 13.40)
+
+# Session key holding the satellite chosen in the pass table. Named rather
+# than inline because it is written by a widget below the map and read by
+# the map above it.
+PASS_TARGET_KEY = "pass_target"
 
 
 # How old an element set may be before its position is worth flagging.
@@ -324,33 +353,198 @@ def classify_staleness(frame: pd.DataFrame) -> pd.DataFrame:
     return frame.assign(is_stale=frame["epoch_age_hours"] > thresholds)
 
 
-def add_colours(frame: pd.DataFrame) -> pd.DataFrame:
-    """Attach the per-regime RGB colour each point is drawn in.
+def add_colours(frame: pd.DataFrame, scheme: str = "Orbit regime") -> pd.DataFrame:
+    """Attach the RGB colour each point is drawn in, under one scheme.
+
+    Colour carries identity, and which identity is a choice: orbital
+    regime says where things fly, object type says what they are. Only
+    one can be active, because a point has one fill.
+
+    Both schemes draw on the same three validated palette slots. That is
+    not a collision — they are mutually exclusive, and the legend names
+    the one in force.
 
     Args:
-        frame: Positions carrying `orbit_regime`.
+        frame: Positions carrying the scheme's category column.
+        scheme: A key of `COLOUR_SCHEMES`.
 
     Returns:
         The frame with a `colour` column of ``[r, g, b]`` lists, which is
-        the form pydeck's ``get_fill_color`` expects.
+        the form pydeck's ``get_fill_color`` expects. A category with no
+        assigned hue — a fourth value, or a null — falls to neutral
+        rather than being dropped or given a generated colour.
     """
+    column, colours = COLOUR_SCHEMES[scheme]
+
     if frame.empty:
         return frame.assign(colour=pd.Series(dtype=object))
 
     return frame.assign(
-        colour=frame["orbit_regime"].map(
-            lambda regime: REGIME_COLOURS.get(regime, NEUTRAL_COLOUR)
-        )
+        colour=frame[column].map(lambda value: colours.get(value, NEUTRAL_COLOUR))
     )
 
 
-def apply_focus(frame: pd.DataFrame, traced_names: set[str]) -> pd.DataFrame:
+def add_look_angles(
+    frame: pd.DataFrame,
+    observer_latitude: float,
+    observer_longitude: float,
+    observer_altitude_km: float = 0.0,
+) -> pd.DataFrame:
+    """Attach where each satellite appears from a point on the ground.
+
+    ── Why the satellite is converted back to ECEF ──────────────────
+    `Position` carries geodetic latitude, longitude and altitude, not an
+    Earth-fixed vector, and look angles need both bodies in the same
+    Cartesian frame before they can be subtracted. `geodetic_to_ecef` is
+    exact and closed-form, and the round trip through it recovers the
+    position `ecef_to_geodetic` started from to well under a millimetre,
+    so nothing is lost by going back.
+
+    The alternative — rotating the stored TEME vector with
+    `teme_to_ecef` — would need the propagation instant threaded down
+    here as well, for a result identical to the millimetre.
+
+    Args:
+        frame: Positions carrying `latitude_deg`, `longitude_deg` and
+            `altitude_km`.
+        observer_latitude: Observer geodetic latitude in degrees.
+        observer_longitude: Observer longitude in degrees.
+        observer_altitude_km: Observer height above the ellipsoid.
+
+    Returns:
+        The frame with `azimuth_deg`, `elevation_deg` and `range_km`
+        added. Elevation is the one that matters: positive means above
+        the observer's horizon.
+    """
+    if frame.empty:
+        return frame.assign(
+            azimuth_deg=pd.Series(dtype=float),
+            elevation_deg=pd.Series(dtype=float),
+            range_km=pd.Series(dtype=float),
+        )
+
+    observer_ecef = frames.geodetic_to_ecef(
+        observer_latitude, observer_longitude, observer_altitude_km
+    )
+
+    angles = [
+        frames.ecef_to_look_angles(
+            observer_ecef,
+            frames.geodetic_to_ecef(latitude, longitude, altitude),
+            observer_latitude,
+            observer_longitude,
+        )
+        for latitude, longitude, altitude in zip(
+            frame["latitude_deg"],
+            frame["longitude_deg"],
+            frame["altitude_km"],
+            strict=True,
+        )
+    ]
+
+    return frame.assign(
+        azimuth_deg=[a[0] for a in angles],
+        elevation_deg=[a[1] for a in angles],
+        range_km=[a[2] for a in angles],
+    )
+
+
+def filter_visible(frame: pd.DataFrame, minimum_elevation: float) -> pd.DataFrame:
+    """Keep only what is above the observer's horizon.
+
+    ── What "visible" means here ────────────────────────────────────
+    Geometric visibility: the satellite is above the local horizontal.
+    NOT optical visibility, which additionally requires the satellite to
+    be sunlit and the observer to be in darkness — that needs a solar
+    ephemeris and Earth's shadow cone, and is a different piece of work.
+
+    Args:
+        frame: Positions carrying `elevation_deg`.
+        minimum_elevation: Degrees above the horizon to require. Zero is
+            the true geometric horizon; ten is a more honest floor for a
+            real sky, where buildings, trees and haze eat the first few
+            degrees.
+
+    Returns:
+        The filtered frame.
+    """
+    if frame.empty:
+        return frame
+
+    return frame[frame["elevation_deg"] >= minimum_elevation]
+
+
+def object_labels(frame: pd.DataFrame) -> dict[int, str]:
+    """Build a human-readable label for each satellite, keyed by NORAD ID.
+
+    Selectors are keyed on `norad_cat_id` rather than on `object_name`,
+    because a name is a label and only the catalog number is an
+    identifier. That distinction is not academic here: all 1,938
+    Fengyun-1C fragments share the single name `FENGYUN 1C DEB`, so a
+    name-keyed selector offers one entry standing for 1,938 satellites
+    and resolves it to whichever happens to come first.
+
+    Across the propagatable catalogue, 18,992 objects carry only 16,356
+    distinct names — so 2,636 of them are unreachable by name at all.
+
+    Args:
+        frame: Positions carrying `norad_cat_id` and `object_name`.
+
+    Returns:
+        A mapping from catalog number to ``"NAME · NORAD"``, or just the
+        number where no name is recorded.
+    """
+    if frame.empty:
+        return {}
+
+    return {
+        int(norad): f"{name} · {int(norad)}" if pd.notna(name) else str(int(norad))
+        for norad, name in zip(
+            frame["norad_cat_id"], frame["object_name"], strict=True
+        )
+    }
+
+
+def focus_set(
+    traced_ids: list[int] | set[int],
+    pass_target: int | None,
+    available: set[int],
+) -> set[int]:
+    """Decide which satellites the map should highlight.
+
+    Two independent selections converge here: the orbits being traced,
+    and the satellite whose passes are being read. Both deserve to stand
+    out, so the map fades everything else.
+
+    Args:
+        traced_ids: Catalog numbers whose orbits are drawn.
+        pass_target: Catalog number chosen in the pass table, if any.
+        available: Catalog numbers currently on the map.
+
+    Returns:
+        The numbers to keep at full opacity. A selection that is no
+        longer on the map is dropped rather than kept: filters change
+        under a stored choice, and highlighting something absent would
+        fade every visible object for no reason — a map that looks
+        broken rather than focused.
+    """
+    highlighted = {norad for norad in traced_ids if norad in available}
+
+    if pass_target is not None and pass_target in available:
+        highlighted.add(pass_target)
+
+    return highlighted
+
+
+def apply_focus(frame: pd.DataFrame, traced_ids: set[int]) -> pd.DataFrame:
     """Dim every object that is not being traced.
 
     Args:
         frame: Positions carrying a `colour` column of ``[r, g, b]``.
-        traced_names: Object names whose orbits are drawn. Empty means
-            nothing is focused, and every object stays fully opaque.
+        traced_ids: NORAD catalog numbers whose orbits are drawn. Keyed
+            by ID rather than name because names are not unique — fading
+            by name would highlight all 1,938 Fengyun-1C fragments at
+            once. Empty means nothing is focused.
 
     Returns:
         The frame with `colour` widened to ``[r, g, b, a]``. Regime hue
@@ -361,12 +555,12 @@ def apply_focus(frame: pd.DataFrame, traced_names: set[str]) -> pd.DataFrame:
     if frame.empty:
         return frame
 
-    if not traced_names:
+    if not traced_ids:
         return frame.assign(
             colour=frame["colour"].map(lambda rgb: [*rgb[:3], FULL_ALPHA])
         )
 
-    focused = frame["object_name"].isin(traced_names)
+    focused = frame["norad_cat_id"].isin(traced_ids)
     return frame.assign(
         colour=[
             [*rgb[:3], FULL_ALPHA if is_focused else FADED_ALPHA]
@@ -375,8 +569,8 @@ def apply_focus(frame: pd.DataFrame, traced_names: set[str]) -> pd.DataFrame:
     )
 
 
-def selected_names(selection: object) -> set[str]:
-    """Read object names out of a pydeck selection event.
+def selected_ids(selection: object) -> set[int]:
+    """Read NORAD catalog numbers out of a pydeck selection event.
 
     Streamlit hands back the underlying data rows for whatever was
     clicked, keyed by layer id. Anything unexpected in that structure is
@@ -389,7 +583,8 @@ def selected_names(selection: object) -> set[str]:
             `st.pydeck_chart` returns.
 
     Returns:
-        The object names that were clicked.
+        The catalog numbers that were clicked. Keyed by ID rather than
+        name because names are not unique; the layer data carries both.
     """
     try:
         objects = selection["objects"][SATELLITE_LAYER_ID]  # type: ignore[index]
@@ -397,9 +592,9 @@ def selected_names(selection: object) -> set[str]:
         return set()
 
     return {
-        row["object_name"]
+        int(row["norad_cat_id"])
         for row in objects
-        if isinstance(row, dict) and row.get("object_name")
+        if isinstance(row, dict) and row.get("norad_cat_id") is not None
     }
 
 
@@ -468,13 +663,14 @@ def load_dimension() -> pd.DataFrame:
 
 @st.cache_data(show_spinner="Tracing orbits…")
 def traced_orbits(
-    object_names: tuple[str, ...], when: datetime, *, ground_track: bool
+    norad_ids: tuple[int, ...], when: datetime, *, ground_track: bool
 ) -> list[Track]:
     """Trace one revolution for each named satellite.
 
     Args:
-        object_names: Names as they appear in `dim_object`. A tuple
-            rather than a list so Streamlit can hash it for the cache.
+        norad_ids: Catalog numbers to trace. A tuple rather than a list
+            so Streamlit can hash it for the cache, and IDs rather than
+            names because names are not unique.
         when: The instant every revolution starts from. Passing it
             explicitly ties the cache to the current snapshot, so
             pressing Refresh re-traces rather than serving stale paths.
@@ -485,21 +681,21 @@ def traced_orbits(
     Returns:
         One `Track` per satellite that resolved and propagated.
     """
-    if not object_names:
+    if not norad_ids:
         return []
 
-    wanted = set(object_names)
-    selected = [elset for elset in load_elsets() if elset.object_name in wanted]
+    wanted = set(norad_ids)
+    selected = [elset for elset in load_elsets() if elset.norad_cat_id in wanted]
     return tracks_module.orbit_tracks(selected, when, ground_track=ground_track)
 
 
 def _selected_paths(
-    object_names: list[str], *, globe: bool, exaggeration: float = 1.0
+    norad_ids: list[int], *, globe: bool, exaggeration: float = 1.0
 ) -> list[dict]:
     """Trace the selected satellites and shape them for the path layer.
 
     Args:
-        object_names: Names chosen in the sidebar.
+        norad_ids: Catalog numbers chosen in the sidebar.
         globe: Whether to build 3-D paths and skip dateline splitting.
             Also selects the frame: the globe draws the closed orbit,
             the flat map the ground track.
@@ -508,12 +704,12 @@ def _selected_paths(
         Path records ready for a `PathLayer`, empty when nothing is
         selected.
     """
-    if not object_names:
+    if not norad_ids:
         return []
 
     return tracks_to_paths(
         traced_orbits(
-            tuple(sorted(object_names)),
+            tuple(sorted(norad_ids)),
             st.session_state.snapshot_ts,
             ground_track=not globe,
         ),
@@ -539,7 +735,10 @@ def snapshot_frame(when: datetime) -> pd.DataFrame:
     positions = elements.propagate(load_elsets(), when)
     frame = attach_dimension(positions_to_frame(positions), load_dimension())
     frame = name_launch_sites(add_speed(frame))
-    return add_colours(classify_staleness(frame))
+    # Colour is applied later, in `main`, rather than here: it depends on
+    # a UI toggle, and folding that into this function's cache key would
+    # re-propagate 19,000 objects every time the scheme changed.
+    return classify_staleness(frame)
 
 
 # ── The app ──────────────────────────────────────────────────────────
@@ -959,6 +1158,85 @@ def globe_html(
     )
 
 
+@st.cache_data(show_spinner="Finding passes…")
+def _cached_passes(
+    norad_id: int,
+    latitude: float,
+    longitude: float,
+    when: datetime,
+    minimum_elevation: float,
+) -> list[passes_module.Pass]:
+    """Find one satellite's passes, cached on everything that changes them.
+
+    Every argument is part of the cache key, so moving the observer or
+    raising the threshold re-searches while an unrelated rerun does not.
+
+    Args:
+        norad_id: Catalog number to search for. An ID rather than a
+            name because names are not unique — 1,938 objects share
+            `FENGYUN 1C DEB`, and resolving that by name would return
+            whichever fragment happened to come first.
+        latitude: Observer geodetic latitude in degrees.
+        longitude: Observer longitude in degrees.
+        when: Instant the search window begins.
+        minimum_elevation: Degrees above the horizon that count.
+
+    Returns:
+        The satellite's passes, or an empty list if the name does not
+        resolve.
+    """
+    elset = next((e for e in load_elsets() if e.norad_cat_id == norad_id), None)
+    if elset is None:
+        return []
+
+    return passes_module.find_passes(
+        elset, latitude, longitude, when, minimum_elevation=minimum_elevation
+    )
+
+
+def passes_to_frame(found: list[passes_module.Pass]) -> pd.DataFrame:
+    """Shape passes into the table an observer reads.
+
+    Column order follows how a pass is actually watched: when it starts
+    and where to look, then how high it gets and when, then where it
+    sets.
+
+    Args:
+        found: Passes from `sat_tracker.propagate.passes.find_passes`.
+
+    Returns:
+        One row per pass. Times are formatted as UTC strings rather than
+        left as datetimes, because a pass table is read rather than
+        computed with, and a timezone-naive-looking column in a UI is a
+        good way to mislead someone.
+    """
+    if not found:
+        return pd.DataFrame(
+            columns=[
+                "Start (UTC)", "Duration (min)", "Start az",
+                "Peak (UTC)", "Peak el", "Peak az",
+                "End (UTC)", "End az", "Truncated",
+            ]
+        )
+
+    return pd.DataFrame(
+        [
+            {
+                "Start (UTC)": f"{p.start_utc:%Y-%m-%d %H:%M:%S}",
+                "Duration (min)": round(p.duration_minutes, 1),
+                "Start az": round(p.start_azimuth_deg),
+                "Peak (UTC)": f"{p.peak_utc:%H:%M:%S}",
+                "Peak el": round(p.peak_elevation_deg, 1),
+                "Peak az": round(p.peak_azimuth_deg),
+                "End (UTC)": f"{p.end_utc:%H:%M:%S}",
+                "End az": round(p.end_azimuth_deg),
+                "Truncated": p.truncated,
+            }
+            for p in found
+        ]
+    )
+
+
 def _render_table(frame: pd.DataFrame, count: int) -> None:
     """Draw the collapsible table beneath the map.
 
@@ -970,42 +1248,116 @@ def _render_table(frame: pd.DataFrame, count: int) -> None:
         frame: The filtered positions.
         count: How many rows are shown, for the expander's label.
     """
+    columns = [
+        "norad_cat_id",
+        "object_name",
+        "object_type",
+        "orbit_regime",
+        "owner",
+        "launch_date",
+        "launch_site_name",
+        "latitude_deg",
+        "longitude_deg",
+        "altitude_km",
+        "speed_km_s",
+        "epoch_age_hours",
+        "is_stale",
+    ]
+    # Look angles only exist when an observer has been set, and they are
+    # the first thing you want when they do — so they lead the table
+    # rather than trailing twelve columns of context.
+    if "elevation_deg" in frame.columns:
+        columns = ["azimuth_deg", "elevation_deg", "range_km", *columns]
+
     with st.expander(f"Table view — {count:,} objects"):
         st.dataframe(
-            frame[
-                [
-                    "norad_cat_id",
-                    "object_name",
-                    "object_type",
-                    "orbit_regime",
-                    "owner",
-                    "launch_date",
-                    "launch_site_name",
-                    "latitude_deg",
-                    "longitude_deg",
-                    "altitude_km",
-                    "speed_km_s",
-                    "epoch_age_hours",
-                    "is_stale",
-                ]
-            ],
+            frame[columns],
             use_container_width=True,
             hide_index=True,
         )
 
 
-def _render_legend() -> None:
-    """Draw the regime legend.
+def _render_passes(
+    frame: pd.DataFrame,
+    observing: bool,
+    latitude: float,
+    longitude: float,
+    minimum_elevation: float,
+) -> None:
+    """Draw the three-day pass table for one chosen satellite.
+
+    Only offered when an observer is set, because a pass is a statement
+    about a place: without one there is nothing for a satellite to rise
+    over.
+
+    Args:
+        frame: The currently visible positions, for the name list.
+        observing: Whether an observer position has been set.
+        latitude: Observer geodetic latitude in degrees.
+        longitude: Observer longitude in degrees.
+        minimum_elevation: Degrees above the horizon that count as a pass.
+    """
+    if not observing or frame.empty:
+        return
+
+    st.subheader("Passes over the next 3 days")
+
+    labels = object_labels(frame)
+    chosen = st.selectbox(
+        "Satellite",
+        options=sorted(labels, key=lambda n: labels[n]),
+        format_func=lambda n: labels[n],
+        index=None,
+        placeholder="Pick one of the objects currently overhead…",
+        # Keyed so the choice survives into the next rerun, where the map
+        # — drawn above this widget, and therefore before it exists — can
+        # read it and fade everything else. Streamlit reruns the whole
+        # script on any widget change, so the map is never more than one
+        # interaction behind.
+        key=PASS_TARGET_KEY,
+    )
+    if chosen is None:
+        return
+
+    found = _cached_passes(
+        chosen, latitude, longitude, st.session_state.snapshot_ts, minimum_elevation
+    )
+    if not found:
+        st.info(
+            f"{labels[chosen]} does not rise above {minimum_elevation}° from "
+            f"{latitude:.2f}, {longitude:.2f} in the next 3 days."
+        )
+        return
+
+    st.dataframe(passes_to_frame(found), use_container_width=True, hide_index=True)
+    st.caption(
+        f"{len(found)} passes above {minimum_elevation}°. Azimuth is degrees "
+        "clockwise from north — 0 N, 90 E, 180 S, 270 W. Times are UTC. "
+        "Accuracy degrades across the window: SGP4 drifts 1–3 km per day "
+        "from epoch, so the far end carries a second or two of timing error. "
+        "A truncated pass was already in progress at a window edge, so its "
+        "reported start or end is the edge rather than the real crossing."
+    )
+
+
+def _render_legend(scheme: str) -> None:
+    """Draw the legend for whichever colour scheme is active.
 
     Identity is never carried by colour alone, so the legend is always
-    present rather than appearing only on hover.
+    present rather than appearing only on hover — and it has to name the
+    active encoding, since the same three hues mean different things
+    under each scheme.
+
+    Args:
+        scheme: A key of `COLOUR_SCHEMES`.
     """
+    _, colours = COLOUR_SCHEMES[scheme]
     swatches = [
         f'<span style="display:inline-flex;align-items:center;margin-right:1.25rem">'
         f'<span style="width:10px;height:10px;border-radius:50%;'
         f"background:rgb({','.join(str(c) for c in colour)});"
         f'margin-right:0.4rem"></span>{label}</span>'
-        for label, colour in [*REGIME_COLOURS.items(), ("unknown", NEUTRAL_COLOUR)]
+        for label, colour in [*colours.items(), ("other", NEUTRAL_COLOUR)]
     ]
     st.markdown(
         f'<div style="font-size:0.85rem;opacity:0.85">{"".join(swatches)}</div>',
@@ -1019,8 +1371,8 @@ def main() -> None:
 
     if "snapshot_ts" not in st.session_state:
         st.session_state.snapshot_ts = datetime.now(UTC)
-    if "clicked_names" not in st.session_state:
-        st.session_state.clicked_names = set()
+    if "clicked_ids" not in st.session_state:
+        st.session_state.clicked_ids = set()
 
     st.title("🛰️ Where everything is")
 
@@ -1044,6 +1396,15 @@ def main() -> None:
             help="A globe is the truer projection for orbital data — Mercator "
             "stretches high latitudes, so polar orbits look far denser than "
             "they are. The globe view is experimental in deck.gl.",
+        )
+
+        scheme = st.radio(
+            "Colour by",
+            options=list(COLOUR_SCHEMES),
+            horizontal=True,
+            help="Regime says where an object flies; type says what it is. "
+            "Only one can be shown, because a point has one fill — the "
+            "legend names whichever is active.",
         )
 
         exaggeration = 1.0
@@ -1088,6 +1449,30 @@ def main() -> None:
             "republish far less often — a flat threshold would wrongly flag them.",
         )
 
+        st.divider()
+        st.subheader("Visible from")
+
+        observe = st.checkbox(
+            "Only what is above the horizon",
+            help="Geometric visibility — the satellite is above the local "
+            "horizontal. Not optical visibility, which also needs the "
+            "satellite sunlit and the observer in darkness.",
+        )
+        observer_lat = st.number_input(
+            "Latitude", value=DEFAULT_OBSERVER[0], min_value=-90.0,
+            max_value=90.0, step=0.01, format="%.4f",
+        )
+        observer_lon = st.number_input(
+            "Longitude", value=DEFAULT_OBSERVER[1], min_value=-180.0,
+            max_value=180.0, step=0.01, format="%.4f",
+        )
+        minimum_elevation = st.slider(
+            "Minimum elevation", 0, 60, 10, step=5, format="%d°",
+            help="0° is the true geometric horizon. 10° is a more honest "
+            "floor for a real sky, where buildings and haze eat the first "
+            "few degrees.",
+        )
+
     visible = apply_filters(
         frame,
         regimes=regimes,
@@ -1097,13 +1482,22 @@ def main() -> None:
         hide_stale=hide_stale,
     )
 
+    if observe:
+        visible = filter_visible(
+            add_look_angles(visible, observer_lat, observer_lon), minimum_elevation
+        )
+
     tracked, stale = len(visible), int(visible["is_stale"].sum()) if len(visible) else 0
     left, middle, right = st.columns(3)
     left.metric("Objects shown", f"{tracked:,}")
     middle.metric("Of the catalogue", f"{len(frame):,}")
-    right.metric("Stale for their regime", f"{stale:,}")
+    if observe:
+        right.metric(f"Above {minimum_elevation}° from here", f"{tracked:,}")
+    else:
+        right.metric("Stale for their regime", f"{stale:,}")
 
-    _render_legend()
+    visible = add_colours(visible, scheme)
+    _render_legend(scheme)
 
     if visible.empty:
         st.warning("No objects match these filters.")
@@ -1121,9 +1515,11 @@ def main() -> None:
         else:
             st.caption("Click a satellite on the map, or search for one by name.")
 
+        labels = object_labels(visible)
         searched = st.multiselect(
             "Trace the orbit of",
-            options=sorted(visible["object_name"].dropna().unique()),
+            options=sorted(labels, key=lambda n: labels[n]),
+            format_func=lambda n: labels[n],
             max_selections=MAX_TRACKS,
             help="Draws one full revolution, sampled over each satellite's own "
             "period. The flat map shows the ground track, which drifts west "
@@ -1131,19 +1527,35 @@ def main() -> None:
             "closed orbit itself, at true altitude.",
         )
 
-        clicked = st.session_state.clicked_names
-        traced_names = sorted(set(searched) | clicked)[:MAX_TRACKS]
+        clicked = st.session_state.clicked_ids
+        traced_ids = sorted(set(searched) | clicked)[:MAX_TRACKS]
 
         if clicked:
             st.caption(f"{len(clicked)} selected by clicking.")
             if st.button("Clear clicked", use_container_width=True):
-                st.session_state.clicked_names = set()
+                st.session_state.clicked_ids = set()
                 st.rerun()
 
     globe = projection == "Globe"
-    paths = _selected_paths(traced_names, globe=globe, exaggeration=exaggeration)
-    focused = apply_focus(visible, set(traced_names))
+    paths = _selected_paths(traced_ids, globe=globe, exaggeration=exaggeration)
 
+    # The satellite chosen in the pass table fades the map too, so the
+    # object whose passes you are reading is the one you can see. Read
+    # from session state because that widget is rendered below the map
+    # and so does not exist yet on this pass through the script.
+    focused = apply_focus(
+        visible,
+        focus_set(
+            traced_ids,
+            st.session_state.get(PASS_TARGET_KEY),
+            set(visible["norad_cat_id"]),
+        ),
+    )
+
+    # The two projections differ only in how the map itself is drawn.
+    # Everything below it is shared, so it lives after the branch rather
+    # than being repeated — an early return here once meant the pass table
+    # appeared on the flat map and silently not on the globe.
     if globe:
         # Rendered as an embedded page rather than through st.pydeck_chart,
         # which cannot draw a globe — see `globe_html` for why.
@@ -1154,24 +1566,23 @@ def main() -> None:
             "Closed orbits at true altitude. The globe is an embedded deck.gl "
             "page, so it needs a network connection."
         )
-        _render_table(visible, tracked)
-        return
+    else:
+        event = st.pydeck_chart(
+            _build_deck(focused, globe=globe, paths=paths),
+            on_select="rerun",
+            selection_mode="multi-object",
+            key="satellite_map",
+        )
 
-    event = st.pydeck_chart(
-        _build_deck(focused, globe=globe, paths=paths),
-        on_select="rerun",
-        selection_mode="multi-object",
-        key="satellite_map",
-    )
-
-    # A click reruns the script, so the newly selected names are merged
-    # into session state and the rerun triggered here draws their tracks.
-    newly_clicked = selected_names(getattr(event, "selection", None))
-    if newly_clicked and not newly_clicked <= st.session_state.clicked_names:
-        st.session_state.clicked_names |= newly_clicked
-        st.rerun()
+        # A click reruns the script, so the newly selected names are merged
+        # into session state and the rerun triggered here draws their tracks.
+        newly_clicked = selected_ids(getattr(event, "selection", None))
+        if newly_clicked and not newly_clicked <= st.session_state.clicked_ids:
+            st.session_state.clicked_ids |= newly_clicked
+            st.rerun()
 
     _render_table(visible, tracked)
+    _render_passes(visible, observe, observer_lat, observer_lon, minimum_elevation)
 
 
 def run() -> None:

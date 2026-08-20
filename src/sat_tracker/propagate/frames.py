@@ -183,6 +183,45 @@ def teme_to_ecef(
 
 
 
+def geodetic_to_ecef(
+    latitude_deg: float, longitude_deg: float, altitude_km: float
+) -> tuple[float, float, float]:
+    """Convert geodetic coordinates to an Earth-fixed position.
+
+    The easy direction. Unlike its inverse this is closed-form and exact,
+    with no approximation to get wrong — which is why it served as the
+    oracle for `ecef_to_geodetic` before it was needed in its own right.
+
+    It is needed now to place an *observer*: look angles are computed
+    from the vector between a point on the ground and a satellite, and
+    that subtraction only means anything with both in the same frame.
+
+    Args:
+        latitude_deg: Geodetic latitude in degrees.
+        longitude_deg: Longitude in degrees.
+        altitude_km: Height above the WGS84 ellipsoid in km.
+
+    Returns:
+        ``(x, y, z)`` in km.
+    """
+    latitude = np.radians(latitude_deg)
+    longitude = np.radians(longitude_deg)
+
+    # Radius of curvature in the prime vertical: how far it is from the
+    # ellipsoid's surface to the polar axis, measured along the normal.
+    # Not the distance to the centre — that is the whole reason geodetic
+    # and geocentric latitude differ.
+    prime_vertical = WGS84_A_KM / np.sqrt(1 - WGS84_E2 * np.sin(latitude) ** 2)
+
+    return (
+        float((prime_vertical + altitude_km) * np.cos(latitude) * np.cos(longitude)),
+        float((prime_vertical + altitude_km) * np.cos(latitude) * np.sin(longitude)),
+        # The (1 - e^2) factor is the ellipsoid's signature: the z axis is
+        # foreshortened relative to the equatorial plane by exactly that.
+        float((prime_vertical * (1 - WGS84_E2) + altitude_km) * np.sin(latitude)),
+    )
+
+
 def ecef_to_geodetic(
     ecef_position_km: tuple[float, float, float],
 ) -> tuple[float, float, float]:
@@ -325,6 +364,97 @@ def ecef_to_geodetic(
         alt  = z / np.sin(lat) - n * (1 - WGS84_E2)
 
     return (np.degrees(lat), np.degrees(lon), alt)
+
+
+
+def ecef_to_look_angles(
+    observer_ecef: tuple[float, float, float],
+    satellite_ecef: tuple[float, float, float],
+    observer_latitude_deg: float,
+    observer_longitude_deg: float,
+) -> tuple[float, float, float]:
+    """Where a satellite appears from a point on the ground.
+
+    Everything so far has answered "where is this object". This answers
+    "where do I look" — which is a different question, and needs the
+    observer in the picture.
+
+    ── The three steps ──────────────────────────────────────────────
+    1. The **range vector**: the satellite's position minus the
+       observer's, still in ECEF axes::
+
+           d = satellite_ecef - observer_ecef
+
+    2. Rotate that vector into the observer's local **East-North-Up**
+       frame. With observer latitude phi and longitude lambda::
+
+           E = -sin(lambda)*dx           + cos(lambda)*dy
+           N = -sin(phi)*cos(lambda)*dx  - sin(phi)*sin(lambda)*dy  + cos(phi)*dz
+           U =  cos(phi)*cos(lambda)*dx  + cos(phi)*sin(lambda)*dy  + sin(phi)*dz
+
+    3. Read the angles off::
+
+           range     = sqrt(dx**2 + dy**2 + dz**2)
+           elevation = asin(U / range)
+           azimuth   = atan2(E, N)
+
+    ── The trap ────────────────────────────────────────────────────
+    Rotate the RANGE VECTOR, not the satellite's own position. Passing
+    `satellite_ecef` straight into the rotation gives the direction from
+    the centre of the Earth, which can be wrong by up to 90 degrees and
+    still looks like a plausible bearing. The subtraction in step 1 is
+    the entire point of the function.
+
+    ── Two smaller ones ────────────────────────────────────────────
+    `atan2(E, N)` takes East first, not North. Azimuth is measured
+    clockwise FROM north, so north is the second argument — the opposite
+    order to the usual `atan2(y, x)`.
+
+    That also means the result runs (-180, 180] and has to be normalised
+    to [0, 360): due west comes out of `atan2` as -90 and must be
+    reported as 270.
+
+    Args:
+        observer_ecef: The observer's Earth-fixed position in km, from
+            `geodetic_to_ecef`.
+        satellite_ecef: The satellite's Earth-fixed position in km, from
+            `teme_to_ecef`. Both must be in the SAME frame at the SAME
+            instant, or the difference between them is meaningless.
+        observer_latitude_deg: Observer geodetic latitude, needed for the
+            rotation. Taken as an argument rather than recovered from
+            `observer_ecef`, since the caller already has it and
+            inverting would reintroduce Bowring's approximation.
+        observer_longitude_deg: Observer longitude, likewise.
+
+    Returns:
+        ``(azimuth_deg, elevation_deg, range_km)``. Azimuth in [0, 360)
+        clockwise from north; elevation in [-90, 90], positive above the
+        horizon; range is the straight-line distance, not ground
+        distance.
+    """
+    # subtract observers position in ECEF from satellites position in ECEF:
+    # resulting in the vector pointing from the position of the observer on earths surface
+    # to the satellite. This is a free vector (no longer pointing from the origin) that
+    # already has the right direction and origin in the observers location, 
+
+    d = np.array(satellite_ecef) - np.array(observer_ecef)
+
+    # We only need to rotate the coordinate system (passive rotation) to express the direction
+    # in the desired coordinates E, N, U which are not angles but linear cartesian coordinates
+    # in East, North, Up direction 
+
+    lam = np.radians(observer_longitude_deg)
+    phi = np.radians(observer_latitude_deg)
+    E = -np.sin(lam)*d[0]              + np.cos(lam)*d[1]
+    N = -np.sin(phi)*np.cos(lam)*d[0]  - np.sin(phi)*np.sin(lam)*d[1]  + np.cos(phi)*d[2]
+    U =  np.cos(phi)*np.cos(lam)*d[0]  + np.cos(phi)*np.sin(lam)*d[1]  + np.sin(phi)*d[2]  
+
+    # We can get elevation and azimuth from that using
+    range_km     = np.linalg.norm(d)
+    elevation = np.arcsin(U / range_km)
+    azimuth   = np.arctan2(E, N)
+
+    return (float(np.degrees(azimuth)%360), float(np.degrees(elevation)), float(range_km))
 
 
 

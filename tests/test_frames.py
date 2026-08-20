@@ -28,43 +28,18 @@ from sat_tracker.propagate.frames import (
     J2000_JD,
     WGS84_A_KM,
     WGS84_B_KM,
-    WGS84_E2,
     ecef_to_geodetic,
+    geodetic_to_ecef,
     gmst_radians,
     teme_to_ecef,
     teme_to_geodetic,
 )
 
-
-def _geodetic_to_ecef(
-    latitude_deg: float, longitude_deg: float, altitude_km: float
-) -> tuple[float, float, float]:
-    """Convert geodetic coordinates to ECEF. The reference implementation.
-
-    This is the easy direction: unlike its inverse it is closed-form and
-    exact, with no approximation to get wrong. That asymmetry is what
-    makes it usable as an oracle — the tests below generate known ECEF
-    vectors with it and require `ecef_to_geodetic` to invert them.
-
-    Args:
-        latitude_deg: Geodetic latitude in degrees.
-        longitude_deg: Longitude in degrees.
-        altitude_km: Height above the WGS84 ellipsoid in km.
-
-    Returns:
-        ``(x, y, z)`` in km.
-    """
-    latitude = math.radians(latitude_deg)
-    longitude = math.radians(longitude_deg)
-
-    # Radius of curvature in the prime vertical.
-    prime_vertical = WGS84_A_KM / math.sqrt(1 - WGS84_E2 * math.sin(latitude) ** 2)
-
-    return (
-        (prime_vertical + altitude_km) * math.cos(latitude) * math.cos(longitude),
-        (prime_vertical + altitude_km) * math.cos(latitude) * math.sin(longitude),
-        (prime_vertical * (1 - WGS84_E2) + altitude_km) * math.sin(latitude),
-    )
+# Was a private copy here, serving as the oracle for `ecef_to_geodetic`.
+# It is now production code — the observer's position needs it — so the
+# round-trip tests below exercise the real function rather than a
+# lookalike that could drift from it.
+_geodetic_to_ecef = geodetic_to_ecef
 
 
 # ── GMST ─────────────────────────────────────────────────────────────
