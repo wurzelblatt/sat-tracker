@@ -1,0 +1,31 @@
+# Continuous Integration: lint and test on every push and pull request.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # uv reads the Python version from .python-version (3.12) and the
+      # exact dependency versions from uv.lock.
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Lint (ruff)
+        run: uv run ruff check .
+
+      # Tests that need Postgres skip themselves when no database is
+      # reachable (see docs/architecture.md, "Testing"), so this runs
+      # the 297 database-free tests; the Postgres-backed ones stay local.
+      - name: Test (pytest)
+        run: uv run pytest -q
